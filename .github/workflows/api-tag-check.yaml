@@ -1,0 +1,45 @@
+name: Verify Required API Tag
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-api-tag:
+    name: Required API tag exists
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Verify required API tag
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          api_module="github.com/NVIDIA/gpu-operator/api"
+          api_version="$(go list -m -mod=mod -f '{{.Version}}' "${api_module}")"
+          api_tag="api/${api_version}"
+          repository_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+
+          echo "Root module requires ${api_module} ${api_version}"
+          echo "Checking for ${api_tag} in ${repository_url}"
+
+          if ! git ls-remote --exit-code --tags \
+            "${repository_url}" "refs/tags/${api_tag}" >/dev/null; then
+            echo "::error::Required API tag ${api_tag} does not exist in ${repository_url}"
+            exit 1
+          fi
