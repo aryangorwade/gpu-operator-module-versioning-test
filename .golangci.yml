@@ -1,0 +1,48 @@
+version: "2"
+linters:
+  enable:
+    - contextcheck
+    - gocritic
+    - gosec
+    - misspell
+    - unconvert
+  settings:
+    gosec:
+      excludes:
+        - G101
+        - G404
+        - G115
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+    rules:
+      - linters:
+          - staticcheck
+        path: (.+)\.go$
+        text: 'SA1019: config.Driver.LicensingConfig.ConfigMapName is deprecated(.+)'
+      - linters:
+          - staticcheck
+        path: (.+)\.go$
+        text: 'SA1019: cr.Spec.LicensingConfig.Name is deprecated(.+)'
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/NVIDIA/gpu-operator
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

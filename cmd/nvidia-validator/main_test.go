@@ -1,0 +1,487 @@
+/*
+ * Copyright (c) 2021, NVIDIA CORPORATION.  All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package main
+
+import (
+	"context"
+	"maps"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/NVIDIA/go-nvlib/pkg/nvmdev"
+	"github.com/NVIDIA/go-nvlib/pkg/nvpci"
+	"github.com/stretchr/testify/require"
+)
+
+func TestResolveHostNvidiaSMI(t *testing.T) {
+	testCases := []struct {
+		description  string
+		contents     map[string]string
+		perms        map[string]os.FileMode
+		expectedPath string
+		expectsError bool
+	}{
+		{
+			description: "nvidia-smi exists in /usr/bin",
+			contents: map[string]string{
+				"/usr/bin/nvidia-smi": "fake nvidia-smi",
+			},
+			expectedPath: "/usr/bin/nvidia-smi",
+		},
+		{
+			description: "nvidia-smi exists through absolute /usr/bin symlink",
+			contents: map[string]string{
+				"/run/current-system/sw/bin/nvidia-smi": "fake nvidia-smi",
+				"/usr/bin":                              "symlink=/run/current-system/sw/bin",
+			},
+			expectedPath: "/usr/bin/nvidia-smi",
+		},
+		{
+			description: "nvidia-smi exists through relative /usr/bin symlink",
+			contents: map[string]string{
+				"/run/current-system/sw/bin/nvidia-smi": "fake nvidia-smi",
+				"/usr/bin":                              "symlink=../run/current-system/sw/bin",
+			},
+			expectedPath: "/usr/bin/nvidia-smi",
+		},
+		{
+			description: "nvidia-smi exists in /opt/bin",
+			contents: map[string]string{
+				"/opt/bin/nvidia-smi": "fake nvidia-smi",
+			},
+			expectedPath: "/opt/bin/nvidia-smi",
+		},
+		{
+			description: "nvidia-smi exists in /bin",
+			contents: map[string]string{
+				"/bin/nvidia-smi": "fake nvidia-smi",
+			},
+			expectedPath: "/bin/nvidia-smi",
+		},
+		{
+			description: "nvidia-smi exists in /usr/sbin",
+			contents: map[string]string{
+				"/usr/sbin/nvidia-smi": "fake nvidia-smi",
+			},
+			expectedPath: "/usr/sbin/nvidia-smi",
+		},
+		{
+			description: "nvidia-smi exists through absolute /usr/sbin symlink",
+			contents: map[string]string{
+				"/run/current-system/sw/bin/nvidia-smi": "fake nvidia-smi",
+				"/usr/sbin":                             "symlink=/run/current-system/sw/bin",
+			},
+			expectedPath: "/usr/sbin/nvidia-smi",
+		},
+		{
+			description: "nvidia-smi exists in WSL path",
+			contents: map[string]string{
+				"/usr/lib/wsl/lib/nvidia-smi": "fake nvidia-smi",
+			},
+			expectedPath: "/usr/lib/wsl/lib/nvidia-smi",
+		},
+		{
+			description: "nvidia-smi exists through absolute WSL path symlink",
+			contents: map[string]string{
+				"/run/wsl/lib/nvidia-smi": "fake nvidia-smi",
+				"/usr/lib/wsl/lib":        "symlink=/run/wsl/lib",
+			},
+			expectedPath: "/usr/lib/wsl/lib/nvidia-smi",
+		},
+		{
+			description: "earlier search path is preferred when multiple exist",
+			contents: map[string]string{
+				"/usr/bin/nvidia-smi":  "fake nvidia-smi in usr/bin",
+				"/usr/sbin/nvidia-smi": "fake nvidia-smi in usr/sbin",
+			},
+			expectedPath: "/usr/bin/nvidia-smi",
+		},
+		{
+			description: "/opt/bin is searched last",
+			contents: map[string]string{
+				"/opt/bin/nvidia-smi":  "fake nvidia-smi in opt/bin",
+				"/usr/sbin/nvidia-smi": "fake nvidia-smi in usr/sbin",
+			},
+			expectedPath: "/usr/sbin/nvidia-smi",
+		},
+		{
+			description: "non-executable nvidia-smi is skipped",
+			contents: map[string]string{
+				"/usr/bin/nvidia-smi": "fake nvidia-smi",
+			},
+			perms: map[string]os.FileMode{
+				"/usr/bin/nvidia-smi": 0600,
+			},
+			expectsError: true,
+		},
+		{
+			description: "empty nvidia-smi is skipped",
+			contents: map[string]string{
+				"/usr/bin/nvidia-smi": "",
+			},
+			expectsError: true,
+		},
+		{
+			description: "parent dir is symlink to path not within root",
+			contents: map[string]string{
+				"/usr/bin": "symlink=../../",
+			},
+			expectsError: true,
+		},
+		{
+			description:  "nvidia-smi does not exist",
+			expectsError: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.description, func(t *testing.T) {
+			hostRoot := t.TempDir()
+			// Iterate in sorted order so parent symlinks are created before paths under them.
+			for _, name := range slices.Sorted(maps.Keys(tc.contents)) {
+				contents := tc.contents[name]
+				target := filepath.Join(hostRoot, name)
+				require.NoError(t, os.MkdirAll(filepath.Dir(target), 0755))
+
+				if strings.HasPrefix(contents, "symlink=") {
+					require.NoError(t, os.Symlink(strings.TrimPrefix(contents, "symlink="), target))
+					continue
+				}
+
+				mode := os.FileMode(0755)
+				if m, ok := tc.perms[name]; ok {
+					mode = m
+				}
+				require.NoError(t, os.WriteFile(target, []byte(contents), mode))
+			}
+
+			nvidiaSMIPath, err := resolveHostNvidiaSMI(hostRoot)
+			if tc.expectsError {
+				require.Error(t, err)
+				return
+			}
+
+			require.NoError(t, err)
+			require.Equal(t, tc.expectedPath, nvidiaSMIPath)
+		})
+	}
+}
+
+func Test_isValidComponent(t *testing.T) {
+	tests := []struct {
+		name      string
+		component string
+		want      bool
+	}{
+		{
+			name:      "valid driver component",
+			component: "driver",
+			want:      true,
+		},
+		{
+			name:      "valid cuda component",
+			component: "cuda",
+			want:      true,
+		},
+		{
+			name:      "valid plugin component",
+			component: "plugin",
+			want:      true,
+		},
+		{
+			name:      "valid toolkit component",
+			component: "toolkit",
+			want:      true,
+		},
+		{
+			name:      "valid nvidia-fs component using constant",
+			component: NVIDIAFS,
+			want:      true,
+		},
+		{
+			name:      "valid gdrcopy component using constant",
+			component: GDRCOPY,
+			want:      true,
+		},
+		{
+			name:      "valid nvidia-peermem component using constant",
+			component: NVIDIAPEERMEM,
+			want:      true,
+		},
+		{
+			name:      "valid mofed component",
+			component: "mofed",
+			want:      true,
+		},
+		{
+			name:      "valid vgpu-manager component",
+			component: "vgpu-manager",
+			want:      true,
+		},
+		{
+			name:      "valid vgpu-devices component",
+			component: "vgpu-devices",
+			want:      true,
+		},
+		{
+			name:      "valid cc-manager component",
+			component: "cc-manager",
+			want:      true,
+		},
+		{
+			name:      "invalid empty component",
+			component: "",
+			want:      false,
+		},
+		{
+			name:      "invalid unknown component",
+			component: "unknown",
+			want:      false,
+		},
+		{
+			name:      "invalid random string",
+			component: "foobar",
+			want:      false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Temporarily set componentFlag for the test
+			originalComponent := componentFlag
+			componentFlag = tt.component
+			defer func() { componentFlag = originalComponent }()
+
+			got := isValidComponent()
+			if got != tt.want {
+				t.Errorf("isValidComponent() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_validateAdditionalDriverComponents(t *testing.T) {
+	tests := []struct {
+		name           string
+		statusFileData string
+		createFile     bool
+		wantErr        bool
+	}{
+		{
+			name:       "status file does not exist",
+			createFile: false,
+			wantErr:    true,
+		},
+		{
+			name: "all features disabled",
+			statusFileData: `GDRCOPY_ENABLED: false
+GDS_ENABLED: false
+GPU_DIRECT_RDMA_ENABLED: false`,
+			createFile: true,
+			wantErr:    false,
+		},
+		{
+			name: "GDRCOPY enabled",
+			statusFileData: `GDRCOPY_ENABLED: true
+GDS_ENABLED: false
+GPU_DIRECT_RDMA_ENABLED: false`,
+			createFile: true,
+			wantErr:    true, // will fail validation without actual kernel module
+		},
+		{
+			name: "GDS (nvidia-fs) enabled",
+			statusFileData: `GDRCOPY_ENABLED: false
+GDS_ENABLED: true
+GPU_DIRECT_RDMA_ENABLED: false`,
+			createFile: true,
+			wantErr:    true, // will fail validation without actual kernel module
+		},
+		{
+			name: "GPU_DIRECT_RDMA (nvidia-peermem) enabled",
+			statusFileData: `GDRCOPY_ENABLED: false
+GDS_ENABLED: false
+GPU_DIRECT_RDMA_ENABLED: true`,
+			createFile: true,
+			wantErr:    true, // will fail validation without actual kernel module
+		},
+		{
+			name: "all features enabled",
+			statusFileData: `GDRCOPY_ENABLED: true
+GDS_ENABLED: true
+GPU_DIRECT_RDMA_ENABLED: true`,
+			createFile: true,
+			wantErr:    true, // will fail validation without actual kernel modules
+		},
+		{
+			name: "unknown feature flag is ignored",
+			statusFileData: `GDRCOPY_ENABLED: false
+GDS_ENABLED: false
+GPU_DIRECT_RDMA_ENABLED: false
+UNKNOWN_FEATURE: true`,
+			createFile: true,
+			wantErr:    false,
+		},
+		{
+			name:           "invalid YAML format",
+			statusFileData: `invalid yaml content {{{`,
+			createFile:     true,
+			wantErr:        true,
+		},
+		{
+			name:           "empty status file",
+			statusFileData: ``,
+			createFile:     true,
+			wantErr:        false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create a temporary directory for the test
+			tmpDir := t.TempDir()
+			testStatusFile := tmpDir + "/.driver-ctr-ready"
+
+			// Create the status file if needed
+			if tt.createFile {
+				err := os.WriteFile(testStatusFile, []byte(tt.statusFileData), 0600)
+				if err != nil {
+					t.Fatalf("Failed to create test status file: %v", err)
+				}
+			}
+
+			err := validateAdditionalDriverComponents(context.Background(), testStatusFile)
+
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("validateAdditionalDriverComponents() expected error but got none")
+				}
+			} else {
+				if err != nil {
+					t.Errorf("validateAdditionalDriverComponents() unexpected error: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func newTestPF(totalVFs, numVFs uint64) *nvpci.NvidiaPCIDevice {
+	return &nvpci.NvidiaPCIDevice{
+		SriovInfo: nvpci.SriovInfo{
+			PhysicalFunction: &nvpci.SriovPhysicalFunction{
+				TotalVFs: totalVFs,
+				NumVFs:   numVFs,
+			},
+		},
+	}
+}
+
+func TestIsDriverUsingSRIOV(t *testing.T) {
+	nonSriovGPU := &nvpci.NvidiaPCIDevice{}
+
+	testCases := []struct {
+		description string
+		gpus        []*nvpci.NvidiaPCIDevice
+		expected    bool
+	}{
+		{
+			description: "no GPUs",
+			gpus:        nil,
+			expected:    false,
+		},
+		{
+			description: "non-SRIOV GPU",
+			gpus:        []*nvpci.NvidiaPCIDevice{nonSriovGPU},
+			expected:    false,
+		},
+		{
+			description: "SRIOV-capable PF with no VFs enabled",
+			gpus:        []*nvpci.NvidiaPCIDevice{newTestPF(16, 0)},
+			expected:    false,
+		},
+		{
+			description: "PF with VFs enabled",
+			gpus:        []*nvpci.NvidiaPCIDevice{newTestPF(16, 16)},
+			expected:    true,
+		},
+		{
+			description: "mixed non-SRIOV GPU and PF with VFs enabled",
+			gpus:        []*nvpci.NvidiaPCIDevice{nonSriovGPU, newTestPF(16, 4)},
+			expected:    true,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.description, func(t *testing.T) {
+			require.Equal(t, tc.expected, isDriverUsingSRIOV(tc.gpus))
+		})
+	}
+}
+
+func TestAreAllVFsReady(t *testing.T) {
+	testCases := []struct {
+		description string
+		gpus        []*nvpci.NvidiaPCIDevice
+		expected    bool
+	}{
+		{
+			description: "no GPUs",
+			gpus:        nil,
+			expected:    false,
+		},
+		{
+			description: "non-SRIOV GPU only",
+			gpus:        []*nvpci.NvidiaPCIDevice{{}},
+			expected:    false,
+		},
+		{
+			description: "PF with only some VFs enabled",
+			gpus:        []*nvpci.NvidiaPCIDevice{newTestPF(16, 4)},
+			expected:    false,
+		},
+		{
+			description: "PF with all VFs enabled",
+			gpus:        []*nvpci.NvidiaPCIDevice{newTestPF(16, 16)},
+			expected:    true,
+		},
+		{
+			description: "one PF complete, one PF incomplete",
+			gpus:        []*nvpci.NvidiaPCIDevice{newTestPF(16, 16), newTestPF(16, 0)},
+			expected:    false,
+		},
+		{
+			description: "all PFs complete",
+			gpus:        []*nvpci.NvidiaPCIDevice{newTestPF(16, 16), newTestPF(8, 8)},
+			expected:    true,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.description, func(t *testing.T) {
+			require.Equal(t, tc.expected, AreAllVFsReady(tc.gpus))
+		})
+	}
+}
+
+func TestMdevParentDevicesExist(t *testing.T) {
+	mock, err := nvmdev.NewMock()
+	require.NoError(t, err)
+	defer mock.Cleanup()
+
+	require.False(t, mdevParentDevicesExist(mock))
+
+	require.NoError(t, mock.AddMockA100Parent("0000:3b:00.0", 0))
+	require.True(t, mdevParentDevicesExist(mock))
+}

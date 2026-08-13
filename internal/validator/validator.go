@@ -1,0 +1,117 @@
+/**
+# Copyright (c) NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+**/
+
+package validator
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sort"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	nvidiav1alpha1 "github.com/NVIDIA/gpu-operator/api/nvidia/v1alpha1"
+)
+
+// Validator provides interface to validate NVIDIADriver fields
+type Validator interface {
+	Validate(ctx context.Context, cr *nvidiav1alpha1.NVIDIADriver) error
+}
+
+// ErrMultipleDefaultNVIDIADrivers is returned when more than one NVIDIADriver is configured as the fallback driver.
+var ErrMultipleDefaultNVIDIADrivers = errors.New("multiple default NVIDIADrivers found")
+
+// nodeSelectorValidator validates against the nodeSelector
+type nodeSelectorValidator struct {
+	client client.Client
+}
+
+// NewNodeSelectorValidator returns a new instance of nodeselector validator
+func NewNodeSelectorValidator(c client.Client) Validator {
+	return &nodeSelectorValidator{client: c}
+}
+
+// Check returns error when nodes matching with the selector labels of current instance of NVIDIADriver
+// are conflicting with other instances of NVIDIADriver
+func (nsv *nodeSelectorValidator) Validate(ctx context.Context, cr *nvidiav1alpha1.NVIDIADriver) error {
+	if err := cr.ValidateNodeSelector(); err != nil {
+		return err
+	}
+
+	drivers := &nvidiav1alpha1.NVIDIADriverList{}
+	err := nsv.client.List(ctx, drivers)
+	if err != nil {
+		return err
+	}
+
+	defaultDriverNames := []string{}
+	for _, driver := range drivers.Items {
+		if err := driver.ValidateNodeSelector(); err != nil {
+			return err
+		}
+		if driver.IsDefault() {
+			if !driver.HasDeletionTimestamp() {
+				defaultDriverNames = append(defaultDriverNames, driver.Name)
+			}
+		}
+	}
+
+	if len(defaultDriverNames) > 1 {
+		sort.Strings(defaultDriverNames)
+		return fmt.Errorf("%w: %v", ErrMultipleDefaultNVIDIADrivers, defaultDriverNames)
+	}
+
+	selectedNodeOwners := map[string][]string{}
+	for _, driver := range drivers.Items {
+		if driver.IsDefault() {
+			continue
+		}
+		driverName := driver.Name
+		nodeList, err := nsv.getNVIDIADriverSelectedNodes(ctx, driver)
+		if err != nil {
+			return err
+		}
+
+		for ni := range nodeList.Items {
+			nodeName := nodeList.Items[ni].Name
+			selectedNodeOwners[nodeName] = append(selectedNodeOwners[nodeName], driverName)
+			if len(selectedNodeOwners[nodeName]) > 1 {
+				sort.Strings(selectedNodeOwners[nodeName])
+				return fmt.Errorf("multiple NVIDIADrivers match the same node %s: %v", nodeName, selectedNodeOwners[nodeName])
+			}
+		}
+
+	}
+
+	return nil
+}
+
+// getNVIDIADriverSelectedNodes returns selected nodes based on the nodeselector labels set for a given NVIDIADriver instance
+func (nsv *nodeSelectorValidator) getNVIDIADriverSelectedNodes(ctx context.Context, cr nvidiav1alpha1.NVIDIADriver) (*corev1.NodeList, error) {
+	nodeList := &corev1.NodeList{}
+
+	selector := labels.Set(cr.GetNodeSelector()).AsSelector()
+
+	opts := []client.ListOption{
+		client.MatchingLabelsSelector{Selector: selector},
+	}
+	err := nsv.client.List(ctx, nodeList, opts...)
+
+	return nodeList, err
+}

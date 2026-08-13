@@ -1,0 +1,377 @@
+/**
+# Copyright (c) NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+**/
+
+package clusterinfo
+
+import (
+	"context"
+	"fmt"
+	"slices"
+	"strings"
+
+	configv1 "github.com/openshift/api/config/v1"
+	ocpconfigv1 "github.com/openshift/client-go/config/clientset/versioned/typed/config/v1"
+	imagesv1 "github.com/openshift/client-go/image/clientset/versioned/typed/image/v1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/discovery"
+	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/rest"
+	"sigs.k8s.io/controller-runtime/pkg/client/config"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	"github.com/NVIDIA/gpu-operator/internal/consts"
+)
+
+// Interface to the clusterinfo package
+type Interface interface {
+	GetContainerRuntime() (string, error)
+	GetOpenshiftVersion() (string, error)
+	GetOpenshiftDriverToolkitImages() map[string]string
+	GetOpenshiftProxySpec() (*configv1.ProxySpec, error)
+	GetDRAResourceGVR() (schema.GroupVersionResource, bool, error)
+}
+type clusterInfo struct {
+	ctx     context.Context
+	config  *rest.Config
+	oneshot bool
+
+	containerRuntime             string
+	openshiftVersion             string
+	openshiftDriverToolkitImages map[string]string
+	proxySpec                    *configv1.ProxySpec
+	draResourceGVR               schema.GroupVersionResource
+	draSupported                 bool
+}
+
+// New creates a new instance of clusterinfo API
+func New(ctx context.Context, opts ...Option) (Interface, error) {
+	l := &clusterInfo{
+		ctx: ctx,
+	}
+	for _, opt := range opts {
+		opt(l)
+	}
+	if l.config == nil {
+		l.config = config.GetConfigOrDie()
+	}
+
+	if !l.oneshot {
+		return l, nil
+	}
+
+	// The 'oneshot' option is configured. Get cluster information now and store
+	// it in the struct. This information will be used when clients request
+	// cluster information.
+	containerRuntime, err := getContainerRuntime(ctx, l.config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get container runtime: %w", err)
+	}
+	l.containerRuntime = containerRuntime
+
+	openshiftVersion, err := getOpenshiftVersion(ctx, l.config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get openshift version: %w", err)
+	}
+	l.openshiftVersion = openshiftVersion
+
+	l.openshiftDriverToolkitImages = getOpenshiftDTKImages(ctx, l.config)
+
+	draResourceGVR, draSupported, err := getDRAResourceGVR(ctx, l.config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to determine DRA support: %w", err)
+	}
+	l.draResourceGVR = draResourceGVR
+	l.draSupported = draSupported
+
+	return l, nil
+}
+
+// Option is a function that configures the clusterInfo library
+type Option func(*clusterInfo)
+
+// WithKubernetesConfig provides an option to set the k8s config used by the library
+func WithKubernetesConfig(config *rest.Config) Option {
+	return func(l *clusterInfo) {
+		l.config = config
+	}
+}
+
+// WithOneShot provides an option to get the cluster information once during initialization
+// of the clusterInfo library. If false, cluster information is fetched every time a client
+// requests information via the interface.
+func WithOneShot(oneshot bool) Option {
+	return func(l *clusterInfo) {
+		l.oneshot = oneshot
+	}
+}
+
+func (l *clusterInfo) GetContainerRuntime() (string, error) {
+	if l.oneshot {
+		return l.containerRuntime, nil
+	}
+
+	return getContainerRuntime(l.ctx, l.config)
+}
+
+// GetOpenshiftVersion returns the OpenShift version detected in the cluster.
+// An empty string, "", is returned if it is determined we are not running on OpenShift.
+func (l *clusterInfo) GetOpenshiftVersion() (string, error) {
+	if l.oneshot {
+		return l.openshiftVersion, nil
+	}
+
+	return getOpenshiftVersion(l.ctx, l.config)
+}
+
+// GetOpenshiftDriverToolkitImages returns a map of the Openshift DriverToolkit Images available for use in the
+// openshift cluster
+func (l *clusterInfo) GetOpenshiftDriverToolkitImages() map[string]string {
+	if l.oneshot {
+		return l.openshiftDriverToolkitImages
+	}
+
+	return getOpenshiftDTKImages(l.ctx, l.config)
+}
+
+func (l *clusterInfo) GetOpenshiftProxySpec() (*configv1.ProxySpec, error) {
+	if l.oneshot {
+		return l.proxySpec, nil
+	}
+
+	return getOpenshiftProxySpec(l.ctx, l.config)
+}
+
+// GetDRAResourceGVR returns the GroupVersionResource to use for resource.k8s.io
+// DeviceClass objects and whether DRA is supported in the cluster. When DRA is
+// not supported the returned bool is false and the GVR is empty.
+func (l *clusterInfo) GetDRAResourceGVR() (schema.GroupVersionResource, bool, error) {
+	if l.oneshot {
+		return l.draResourceGVR, l.draSupported, nil
+	}
+
+	return getDRAResourceGVR(l.ctx, l.config)
+}
+
+// getDRAResourceGVR discovers whether the cluster serves the resource.k8s.io
+// DeviceClass resource and, if so, the preferred version to use (v1 over v1beta2
+// over v1beta1).
+func getDRAResourceGVR(ctx context.Context, config *rest.Config) (schema.GroupVersionResource, bool, error) {
+	logger := log.FromContext(ctx)
+	var gvr schema.GroupVersionResource
+
+	discoveryClient, err := discovery.NewDiscoveryClientForConfig(config)
+	if err != nil {
+		return gvr, false, fmt.Errorf("error building discovery client: %w", err)
+	}
+
+	apiResourceLists, err := discoveryClient.ServerPreferredResources()
+	if err != nil {
+		// ServerPreferredResources can return partial results alongside an
+		// ErrGroupDiscoveryFailed when an unrelated API group is unreachable. Keep
+		// the partial results in that case so a flaky group can't mask resource.k8s.io.
+		if !discovery.IsGroupDiscoveryFailedError(err) {
+			return gvr, false, fmt.Errorf("error getting server resources from discovery client: %w", err)
+		}
+		logger.V(consts.LogLevelWarning).Info("partial API discovery failure; continuing with discovered groups", "error", err.Error())
+	}
+
+	var groupVersions []string
+	for _, list := range apiResourceLists {
+		for _, resource := range list.APIResources {
+			if resource.Kind == "DeviceClass" {
+				groupVersions = append(groupVersions, list.GroupVersion)
+			}
+		}
+	}
+
+	if len(groupVersions) == 0 {
+		return gvr, false, nil
+	}
+	logger.V(consts.LogLevelInfo).Info("Discovered DeviceClass resource",
+		"groupVersions", strings.Join(groupVersions, ", "))
+
+	for _, version := range []string{"v1", "v1beta2", "v1beta1"} {
+		if slices.Contains(groupVersions, "resource.k8s.io/"+version) {
+			return schema.GroupVersionResource{Group: "resource.k8s.io", Version: version, Resource: "deviceclasses"}, true, nil
+		}
+	}
+
+	return gvr, false, fmt.Errorf("could not determine the GVR for the DeviceClass resource from discovered group/versions: %s",
+		strings.Join(groupVersions, ", "))
+}
+
+func getContainerRuntime(ctx context.Context, config *rest.Config) (string, error) {
+	logger := log.FromContext(ctx)
+
+	k8sClient, err := corev1client.NewForConfig(config)
+	if err != nil {
+		logger.Error(err, "failed to build k8s core v1 client")
+		return "", err
+	}
+
+	ocpVersion, err := getOpenshiftVersion(ctx, config)
+	if err != nil {
+		logger.Error(err, "failed to retrieve")
+	}
+	if ocpVersion != "" {
+		return consts.CRIO, nil
+	}
+
+	nodeSelector := map[string]string{
+		consts.GPUPresentLabel: "true",
+	}
+
+	list, err := k8sClient.Nodes().List(ctx, metav1.ListOptions{
+		LabelSelector: labels.SelectorFromSet(nodeSelector).String(),
+	})
+	if err != nil {
+		return "", fmt.Errorf("unable to list nodes prior to checking container runtime: %w", err)
+	}
+
+	var runtime string
+	for _, node := range list.Items {
+		rt, err := getRuntimeString(node)
+		if err != nil {
+			logger.Info(fmt.Sprintf("Unable to get runtime info for node %s: %v", node.Name, err))
+			continue
+		}
+		runtime = rt
+		if runtime == consts.Containerd {
+			// default to containerd if >=1 node running containerd
+			break
+		}
+	}
+
+	if runtime == "" {
+		logger.Info("Unable to get runtime info from the cluster, defaulting to containerd")
+		runtime = consts.Containerd
+	}
+	return runtime, nil
+}
+
+func getOpenshiftVersion(ctx context.Context, config *rest.Config) (string, error) {
+	client, err := ocpconfigv1.NewForConfig(config)
+	if err != nil {
+		return "", err
+	}
+
+	v, err := client.ClusterVersions().Get(ctx, "version", metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			// not an OpenShift cluster
+			return "", nil
+		}
+		return "", err
+	}
+
+	for _, condition := range v.Status.History {
+		if condition.State != "Completed" {
+			continue
+		}
+
+		ocpV := strings.Split(condition.Version, ".")
+		if len(ocpV) > 1 {
+			return ocpV[0] + "." + ocpV[1], nil
+		}
+		return ocpV[0], nil
+	}
+
+	return "", fmt.Errorf("failed to find Completed Cluster Version")
+}
+
+func getOpenshiftDTKImages(ctx context.Context, c *rest.Config) map[string]string {
+	var rhcosDriverToolkitImages map[string]string
+	logger := log.FromContext(ctx)
+
+	name := "driver-toolkit"
+	namespace := consts.OpenshiftNamespace
+
+	ocpImageClient, err := imagesv1.NewForConfig(c)
+	if err != nil {
+		logger.Error(err, "failed to build openshift image stream client")
+		return nil
+	}
+
+	imgStream, err := ocpImageClient.ImageStreams(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			logger.Info("ocpHasDriverToolkitImageStream: driver-toolkit imagestream not found",
+				"Name", name,
+				"Namespace", namespace)
+		}
+		logger.Error(err, "Couldn't get the driver-toolkit imagestream")
+		return nil
+	}
+
+	for _, tag := range imgStream.Spec.Tags {
+		if tag.Name == "" {
+			logger.Info("WARNING: ocpHasDriverToolkitImageStream: driver-toolkit imagestream is broken, see RHBZ#2015024")
+			continue
+		}
+		if tag.Name == "latest" || tag.From == nil {
+			continue
+		}
+
+		if rhcosDriverToolkitImages == nil {
+			rhcosDriverToolkitImages = map[string]string{}
+		}
+
+		logger.Info("ocpHasDriverToolkitImageStream: tag", tag.Name, tag.From.Name)
+		rhcosDriverToolkitImages[tag.Name] = tag.From.Name
+	}
+
+	// TODO: Add code to update operator metrics
+	// TODO: Add code to ensure OCP Namespace Monitoring setting
+
+	return rhcosDriverToolkitImages
+}
+
+func getOpenshiftProxySpec(ctx context.Context, cfg *rest.Config) (*configv1.ProxySpec, error) {
+	logger := log.FromContext(ctx)
+
+	client, err := ocpconfigv1.NewForConfig(cfg)
+	if err != nil {
+		logger.Error(err, "error instantiating openshift config client")
+	}
+
+	proxy, err := client.Proxies().Get(ctx, "cluster", metav1.GetOptions{})
+	if err != nil {
+		logger.Error(err, "error retrieving proxies for openshift cluster")
+		return nil, err
+	}
+	return &proxy.Spec, nil
+}
+
+func getRuntimeString(node corev1.Node) (string, error) {
+	// ContainerRuntimeVersion string will look like <runtime>://<x.y.z>
+	runtimeVer := node.Status.NodeInfo.ContainerRuntimeVersion
+	var runtime string
+	switch {
+	case strings.HasPrefix(runtimeVer, "docker"):
+		runtime = consts.Docker
+	case strings.HasPrefix(runtimeVer, "containerd"):
+		runtime = consts.Containerd
+	case strings.HasPrefix(runtimeVer, "cri-o"):
+		runtime = consts.CRIO
+	default:
+		return "", fmt.Errorf("runtime not recognized: %s", runtimeVer)
+	}
+	return runtime, nil
+}

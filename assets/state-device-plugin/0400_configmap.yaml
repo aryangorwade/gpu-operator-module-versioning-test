@@ -1,0 +1,52 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nvidia-device-plugin-entrypoint
+  namespace: "FILLED BY THE OPERATOR"
+  labels:
+    app: nvidia-device-plugin-daemonset
+data:
+  entrypoint.sh: |-
+    #!/bin/sh
+
+    until [ -f /run/nvidia/validations/driver-ready ]
+    do
+      echo "waiting for the driver validations to be ready..."
+      sleep 5
+    done
+    
+    set -o allexport
+    cat /run/nvidia/validations/driver-ready
+    . /run/nvidia/validations/driver-ready
+    
+    extra_modules="gdrdrv nvidia_fs"
+    > feature-flags.env
+    for module in ${extra_modules}; do
+        if lsmod | grep -q "^$module "; then
+            case "$module" in
+                "gdrdrv")
+                  if [ -z "$GDRCOPY_ENABLED" ]; then
+                      echo "GDRCOPY_ENABLED=true" >> feature-flags.env
+                  fi
+                ;;
+                "nvidia_fs")
+                  if [ -z "$GDS_ENABLED" ]; then
+                      echo "GDS_ENABLED=true" >> feature-flags.env
+                  fi
+                  if [ -z "$MOFED_ENABLED" ]; then
+                      echo "MOFED_ENABLED=true" >> feature-flags.env
+                  fi
+                ;;
+            esac
+        fi
+    done
+    
+    if [ -s "feature-flags.env" ]; then
+        echo "Enabling nvidia-device-plugin feature flags..."
+        cat feature-flags.env
+        . ./feature-flags.env
+    fi
+
+    echo "Starting nvidia-device-plugin"
+    exec nvidia-device-plugin
+    

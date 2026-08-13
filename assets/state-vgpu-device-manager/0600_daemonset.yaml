@@ -1,0 +1,88 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  labels:
+    app: nvidia-vgpu-device-manager
+  namespace: "FILLED BY THE OPERATOR"
+  name: nvidia-vgpu-device-manager
+  annotations:
+    openshift.io/scc: nvidia-vgpu-device-manager
+spec:
+  selector:
+    matchLabels:
+      app: nvidia-vgpu-device-manager
+  template:
+    metadata:
+      labels:
+        app: nvidia-vgpu-device-manager
+    spec:
+      nodeSelector:
+        nvidia.com/gpu.deploy.vgpu-device-manager: "true"
+      priorityClassName: system-node-critical
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      serviceAccountName: nvidia-vgpu-device-manager
+      initContainers:
+        - name: vgpu-manager-validation
+          image: "FILLED BY THE OPERATOR"
+          command: ['sh', '-c']
+          # The validator writes vgpu-manager-ready when the vGPU Manager is
+          # deployed as a container, and host-vgpu-manager-ready when the vGPU
+          # Manager driver is pre-installed on the host. Wait for either so this
+          # operand starts in both cases.
+          args: ["until [ -f /run/nvidia/validations/vgpu-manager-ready ] || [ -f /run/nvidia/validations/host-vgpu-manager-ready ]; do echo waiting for NVIDIA vGPU Manager to be setup; sleep 5; done"]
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: run-nvidia-validations
+              mountPath: /run/nvidia/validations
+              mountPropagation: Bidirectional
+      containers:
+      - name: nvidia-vgpu-device-manager
+        image: "FILLED BY THE OPERATOR"
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: CONFIG_FILE
+          value: "/vgpu-config/config.yaml"
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - mountPath: /vgpu-config
+          name: vgpu-config
+        - mountPath: /sys
+          name: host-sys
+        - mountPath: /host
+          name: host-root
+          mountPropagation: HostToContainer
+        - name: driver-install-dir
+          mountPath: /driver-root
+          mountPropagation: HostToContainer
+      volumes:
+      - name: vgpu-config
+        configMap:
+          name: "FILLED BY THE OPERATOR"
+      - name: host-sys
+        hostPath:
+          path: /sys
+          type: Directory
+      - name: host-root
+        hostPath:
+          path: "/"
+      - name: driver-install-dir
+        hostPath:
+          path: "/run/nvidia/driver"
+          type: DirectoryOrCreate
+      - name: run-nvidia-validations
+        hostPath:
+          path: /run/nvidia/validations
+          type: DirectoryOrCreate

@@ -1,0 +1,180 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "prHourlyLimit": 10,
+  "prConcurrentLimit": 10,
+  "dependencyDashboard": false,
+  "extends": [
+    "config:recommended",
+    ":disableDependencyDashboard",
+    "config:recommended",
+    ":disableDependencyDashboard",
+    "config:recommended",
+    ":disableDependencyDashboard",
+    "config:recommended",
+    ":disableDependencyDashboard",
+    "config:recommended",
+    ":disableDependencyDashboard",
+    "config:recommended",
+    ":disableDependencyDashboard",
+    "config:recommended",
+    ":disableDependencyDashboard",
+    "config:recommended",
+    ":disableDependencyDashboard"
+  ],
+  "forkProcessing": "enabled",
+  "ignorePaths": ["vendor/**"],
+  "enabledManagers": ["custom.regex"],
+  "recreateWhen": "always",
+  "separateMultipleMajor": false,
+  "separateMinorPatch": false,
+  "pruneStaleBranches": true,
+  "rebaseWhen": "always",
+
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "deployments/gpu-operator/values.yaml"
+      ],
+      "matchStrings": [
+        "[-\\s]*repository:\\s*(?<repo>\\S+)\\s*\\n(?:\\s*#.*\\n|\\s*\\n)*[-\\s]*image:\\s*(?<image>\\S+)\\s*\\n(?:\\s*#.*\\n|\\s*\\n)*[-\\s]*version:\\s*\"?(?<currentValue>[^\"\\s]+)\"?"
+      ],
+      "depNameTemplate": "{{repo}}/{{image}}",
+      "datasourceTemplate": "docker",
+      "versioningTemplate": "loose"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "bundle/manifests/gpu-operator-certified.clusterserviceversion.yaml"
+      ],
+      "matchStrings": [
+        "(?:value|image):\\s*[\"']?(?<depName>[^:\"'\\s]+):(?<currentValue>[^@\"'\\s]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
+      ],
+      "datasourceTemplate": "docker"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "versions.mk"
+      ],
+      "matchStrings": [
+        "GOLANG_VERSION \\?= (?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "go",
+      "datasourceTemplate": "golang-version",
+      "versioningTemplate": "semver"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "docker/Dockerfile"
+      ],
+      "matchStrings": [
+        "FROM golang:(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "go",
+      "datasourceTemplate": "golang-version",
+      "versioningTemplate": "semver"
+    }
+  ],
+  "labels": [
+    "dependencies",
+    "renovate"
+  ],
+  "packageRules": [
+    {
+      "matchFileNames": ["deployments/gpu-operator/values.yaml"],
+      "matchPackageNames": [
+        "nvcr.io/nvidia/cloud-native/k8s-driver-manager",
+        "nvcr.io/nvidia/cloud-native/k8s-kata-manager",
+        "nvcr.io/nvidia/cloud-native/vgpu-device-manager",
+        "nvcr.io/nvidia/cloud-native/k8s-cc-manager",
+        "nvcr.io/nvidia/cloud-native/nvidia-sandbox-device-plugin",
+        "nvcr.io/nvidia/kubevirt-gpu-device-plugin",
+        "nvcr.io/nvidia/k8s-device-plugin",
+        "nvcr.io/nvidia/cloud-native/k8s-mig-manager"
+      ],
+      "versioning": "regex:^v?(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)$",
+      "separateMajorMinor": false
+    },
+    {
+      "matchFileNames": [
+        "deployments/gpu-operator/values.yaml",
+        "bundle/manifests/gpu-operator-certified.clusterserviceversion.yaml"
+      ],
+      "matchPackageNames": [
+        "nvcr.io/nvidia/k8s/container-toolkit"
+      ],
+      "versioning": "regex:^v?(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)(?:-(?<prerelease>rc\\.\\d+))?$",
+      "ignoreUnstable": false,
+      "separateMajorMinor": false
+    },
+    {
+      "matchFileNames": [
+        "deployments/gpu-operator/values.yaml",
+        "bundle/manifests/gpu-operator-certified.clusterserviceversion.yaml"
+      ],
+      "matchPackageNames": [
+        "nvcr.io/nvidia/k8s/dcgm-exporter"
+      ],
+      "versioning": "regex:^v?(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)-\\d+\\.\\d+\\.\\d+-distroless$",
+      "separateMajorMinor": false
+    },
+    {
+      "matchFileNames": ["bundle/manifests/gpu-operator-certified.clusterserviceversion.yaml"],
+      "matchPackageNames": [
+        "nvcr.io/nvidia/cloud-native/dcgm"
+      ],
+      "versioning": "regex:^(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)-(?<build>\\d+)-ubi\\d+$",
+      "separateMajorMinor": false
+    },
+    {
+      "matchFileNames": ["deployments/gpu-operator/values.yaml"],
+      "matchPackageNames": [
+        "nvcr.io/nvidia/cuda"
+      ],
+      "versioning": "regex:^(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)-base-ubi9$",
+      "separateMajorMinor": false
+    },
+    {
+      "description": "Keep only the base gdrcopy version as the OS suffix is added at runtime",
+      "matchFileNames": ["deployments/gpu-operator/values.yaml"],
+      "matchPackageNames": ["nvcr.io/nvidia/cloud-native/gdrdrv"],
+      "extractVersion": "^(?<version>v?\\d+\\.\\d+(?:\\.\\d+)?)(?:-.*)?$",
+      "versioning": "loose"
+    },
+    {
+      "description": "Keep only the base GDS version as the OS suffix is added at runtime",
+      "matchFileNames": ["deployments/gpu-operator/values.yaml"],
+      "matchPackageNames": ["nvcr.io/nvidia/cloud-native/nvidia-fs"],
+      "extractVersion": "^(?<version>v?\\d+\\.\\d+(?:\\.\\d+)?)(?:-.*)?$",
+      "versioning": "loose"
+    },
+    {
+      "matchFileNames": ["bundle/manifests/gpu-operator-certified.clusterserviceversion.yaml"],
+      "matchPackageNames": ["nvcr.io/nvidia/cloud-native/gdrdrv"],
+      "enabled": false
+    },
+    {
+      "matchPackageNames": ["nvcr.io/nvidia/driver"],
+      "enabled": false
+    },
+    {
+      "matchDatasources": ["docker"],
+      "groupName": "{{depName}}",
+      "branchTopic": "{{depName}}",
+      "commitMessageTopic": "{{depName}}"
+    },
+    {
+      "description": "Group all Go toolchain version bumps",
+      "matchManagers": ["custom.regex"],
+      "matchPackageNames": ["go"],
+      "matchDatasources": ["golang-version"],
+      "groupName": "Go toolchain",
+      "groupSlug": "go-toolchain",
+      "separateMajorMinor": false,
+      "separateMinorPatch": false
+    }
+  ]
+}

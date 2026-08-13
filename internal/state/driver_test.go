@@ -1,0 +1,1312 @@
+/**
+# Copyright (c) NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+**/
+
+package state
+
+import (
+	"bytes"
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	configv1 "github.com/openshift/api/config/v1"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/runtime/serializer/json"
+	apitypes "k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	nvidiav1alpha1 "github.com/NVIDIA/gpu-operator/api/nvidia/v1alpha1"
+	"github.com/NVIDIA/gpu-operator/internal/consts"
+	"github.com/NVIDIA/gpu-operator/internal/render"
+)
+
+const (
+	manifestDir       = "../../manifests/state-driver"
+	manifestResultDir = "./testdata/golden"
+)
+
+type testClusterInfo struct {
+	runtime          string
+	openshiftVersion string
+	draResourceGVR   schema.GroupVersionResource
+	draSupported     bool
+}
+
+func (i testClusterInfo) GetContainerRuntime() (string, error) {
+	return i.runtime, nil
+}
+
+func (i testClusterInfo) GetOpenshiftVersion() (string, error) {
+	return i.openshiftVersion, nil
+}
+
+func (i testClusterInfo) GetOpenshiftDriverToolkitImages() map[string]string {
+	return nil
+}
+
+func (i testClusterInfo) GetOpenshiftProxySpec() (*configv1.ProxySpec, error) {
+	return nil, nil
+}
+
+func (i testClusterInfo) GetDRAResourceGVR() (schema.GroupVersionResource, bool, error) {
+	return i.draResourceGVR, i.draSupported, nil
+}
+
+func getYAMLString(objs []*unstructured.Unstructured) (string, error) {
+	s := json.NewSerializerWithOptions(json.DefaultMetaFactory, scheme.Scheme,
+		scheme.Scheme, json.SerializerOptions{Yaml: true, Pretty: false, Strict: false})
+	var sb strings.Builder
+	for _, obj := range objs {
+		var b bytes.Buffer
+		err := s.Encode(obj, &b)
+		if err != nil {
+			return "", err
+		}
+		sb.WriteString(b.String())
+		sb.WriteString("---\n")
+	}
+	return sb.String(), nil
+}
+
+func hasSubscriptionVolumeMount(volumeMounts []corev1.VolumeMount) bool {
+	for _, volumeMount := range volumeMounts {
+		if strings.HasPrefix(volumeMount.Name, "subscription-config-") {
+			return true
+		}
+	}
+	return false
+}
+
+func assertSubscriptionHostPathVolumes(t *testing.T, volumes []corev1.Volume, expected map[string]corev1.HostPathType) {
+	t.Helper()
+
+	if expected == nil {
+		expected = map[string]corev1.HostPathType{}
+	}
+
+	actual := map[string]corev1.HostPathType{}
+	for _, volume := range volumes {
+		if !strings.HasPrefix(volume.Name, "subscription-config-") {
+			continue
+		}
+		require.NotNil(t, volume.HostPath)
+		require.NotNil(t, volume.HostPath.Type)
+		actual[volume.HostPath.Path] = *volume.HostPath.Type
+	}
+
+	assert.Equal(t, expected, actual)
+}
+
+func TestDriverRenderMinimal(t *testing.T) {
+	// Construct a sample driver state manager
+	const (
+		testName = "driver-minimal"
+	)
+
+	state, err := NewStateDriver(nil, "", nil, manifestDir)
+	require.Nil(t, err)
+	stateDriver, ok := state.(*stateDriver)
+	require.True(t, ok)
+
+	renderData := getMinimalDriverRenderData()
+
+	objs, err := stateDriver.renderer.RenderObjects(
+		&render.TemplatingData{
+			Data: renderData,
+		})
+	require.Nil(t, err)
+	require.NotEmpty(t, objs)
+
+	actual, err := getYAMLString(objs)
+	require.Nil(t, err)
+
+	o, err := os.ReadFile(filepath.Join(manifestResultDir, testName+".yaml"))
+	require.Nil(t, err)
+
+	require.Equal(t, string(o), actual)
+}
+
+func TestDriverManagerResources(t *testing.T) {
+	state, err := NewStateDriver(nil, "", nil, manifestDir)
+	require.NoError(t, err)
+	stateDriver, ok := state.(*stateDriver)
+	require.True(t, ok)
+
+	renderData := getMinimalDriverRenderData()
+	objs, err := stateDriver.renderer.RenderObjects(
+		&render.TemplatingData{
+			Data: renderData,
+		})
+	require.NoError(t, err)
+
+	ds, err := getDaemonsetFromObjects(objs)
+	require.NoError(t, err)
+
+	var driverManager *corev1.Container
+	for i := range ds.Spec.Template.Spec.InitContainers {
+		if ds.Spec.Template.Spec.InitContainers[i].Name == "k8s-driver-manager" {
+			driverManager = &ds.Spec.Template.Spec.InitContainers[i]
+			break
+		}
+	}
+	require.NotNil(t, driverManager)
+	require.EqualValues(t, corev1.ResourceRequirements{
+		Requests: renderData.Driver.Spec.Resources.Requests,
+		Limits:   renderData.Driver.Spec.Resources.Limits,
+	}, driverManager.Resources)
+}
+
+func TestDriverHostSysDevicesSystemVolumeUsesStableParentDirectory(t *testing.T) {
+	state, err := NewStateDriver(nil, "", nil, manifestDir)
+	require.Nil(t, err)
+	stateDriver, ok := state.(*stateDriver)
+	require.True(t, ok)
+
+	objs, err := stateDriver.renderer.RenderObjects(
+		&render.TemplatingData{
+			Data: getMinimalDriverRenderData(),
+		})
+	require.Nil(t, err)
+	require.NotEmpty(t, objs)
+
+	ds, err := getDaemonsetFromObjects(objs)
+	require.Nil(t, err)
+
+	var hostSysDevicesSystemVolume *corev1.Volume
+	for i := range ds.Spec.Template.Spec.Volumes {
+		if ds.Spec.Template.Spec.Volumes[i].Name == "host-sys-devices-system" {
+			hostSysDevicesSystemVolume = &ds.Spec.Template.Spec.Volumes[i]
+			break
+		}
+	}
+	require.NotNil(t, hostSysDevicesSystemVolume)
+	require.NotNil(t, hostSysDevicesSystemVolume.HostPath)
+	require.NotNil(t, hostSysDevicesSystemVolume.HostPath.Type)
+	assert.Equal(t, "/sys/devices/system", hostSysDevicesSystemVolume.HostPath.Path)
+	assert.Equal(t, corev1.HostPathDirectory, *hostSysDevicesSystemVolume.HostPath.Type)
+
+	var driverContainer *corev1.Container
+	for i := range ds.Spec.Template.Spec.Containers {
+		if ds.Spec.Template.Spec.Containers[i].Name == "nvidia-driver-ctr" {
+			driverContainer = &ds.Spec.Template.Spec.Containers[i]
+			break
+		}
+	}
+	require.NotNil(t, driverContainer)
+
+	var hostSysDevicesSystemMount *corev1.VolumeMount
+	for i := range driverContainer.VolumeMounts {
+		if driverContainer.VolumeMounts[i].Name == "host-sys-devices-system" {
+			hostSysDevicesSystemMount = &driverContainer.VolumeMounts[i]
+			break
+		}
+	}
+	require.NotNil(t, hostSysDevicesSystemMount)
+	assert.Equal(t, "/sys/devices/system", hostSysDevicesSystemMount.MountPath)
+	assert.Empty(t, hostSysDevicesSystemMount.SubPath)
+}
+
+func TestDriverRenderMissingHostRoot(t *testing.T) {
+	state, err := NewStateDriver(nil, "", nil, manifestDir)
+	require.Nil(t, err)
+	stateDriver, ok := state.(*stateDriver)
+	require.True(t, ok)
+
+	catalog := NewInfoCatalog()
+	catalog.Add(InfoTypeClusterInfo, testClusterInfo{})
+
+	_, err = stateDriver.getManifestObjects(context.Background(), &nvidiav1alpha1.NVIDIADriver{}, catalog)
+	require.Error(t, err, "rendering must fail when no host root is in the catalog")
+	require.Contains(t, err.Error(), "host root")
+}
+
+func TestDriverHostNetwork(t *testing.T) {
+	const (
+		testName = "driver-hostnetwork"
+	)
+
+	state, err := NewStateDriver(nil, "", nil, manifestDir)
+	require.Nil(t, err)
+	stateDriver, ok := state.(*stateDriver)
+	require.True(t, ok)
+
+	renderData := getMinimalDriverRenderData()
+	renderData.Driver.Spec.HostNetwork = ptr.To(true)
+
+	objs, err := stateDriver.renderer.RenderObjects(
+		&render.TemplatingData{
+			Data: renderData,
+		})
+	require.Nil(t, err)
+	require.NotEmpty(t, objs)
+
+	actual, err := getYAMLString(objs)
+	require.Nil(t, err)
+
+	o, err := os.ReadFile(filepath.Join(manifestResultDir, testName+".yaml"))
+	require.Nil(t, err)
+
+	require.Equal(t, string(o), actual)
+}
+
+func TestDriverRenderRDMA(t *testing.T) {
+	// Construct a sample driver state manager
+	const (
+		testName = "driver-rdma"
+	)
+
+	state, err := NewStateDriver(nil, "", nil, manifestDir)
+	require.Nil(t, err)
+	stateDriver, ok := state.(*stateDriver)
+	require.True(t, ok)
+
+	renderData := getMinimalDriverRenderData()
+
+	renderData.AdditionalConfigs = getSampleAdditionalConfigs()
+
+	renderData.GPUDirectRDMA = &nvidiav1alpha1.GPUDirectRDMASpec{
+		Enabled: ptr.To(true),
+	}
+
+	objs, err := stateDriver.renderer.RenderObjects(
+		&render.TemplatingData{
+			Data: renderData,
+		})
+	require.Nil(t, err)
+	require.NotEmpty(t, objs)
+
+	actual, err := getYAMLString(objs)
+	require.Nil(t, err)
+
+	o, err := os.ReadFile(filepath.Join(manifestResultDir, testName+".yaml"))
+	require.Nil(t, err)
+
+	require.Equal(t, string(o), actual)
+}
+
+func TestDriverRDMAHostMOFED(t *testing.T) {
+	const (
+		testName = "driver-rdma-hostmofed"
+	)
+	state, err := NewStateDriver(nil, "", nil, manifestDir)
+	require.Nil(t, err)
+	stateDriver, ok := state.(*stateDriver)
+	require.True(t, ok)
+
+	renderData := getMinimalDriverRenderData()
+
+	renderData.AdditionalConfigs = getSampleAdditionalConfigs()
+
+	renderData.GPUDirectRDMA = &nvidiav1alpha1.GPUDirectRDMASpec{
+		Enabled:      ptr.To(true),
+		UseHostMOFED: ptr.To(true),
+	}
+
+	objs, err := stateDriver.renderer.RenderObjects(
+		&render.TemplatingData{
+			Data: renderData,
+		})
+	require.Nil(t, err)
+	require.NotEmpty(t, objs)
+
+	actual, err := getYAMLString(objs)
+	require.Nil(t, err)
+
+	o, err := os.ReadFile(filepath.Join(manifestResultDir, testName+".yaml"))
+	require.Nil(t, err)
+
+	require.Equal(t, string(o), actual)
+}
+
+func TestDriverSpec(t *testing.T) {
+	const (
+		testName = "driver-full-spec"
+	)
+	state, err := NewStateDriver(nil, "", nil, manifestDir)
+	require.Nil(t, err)
+	stateDriver, ok := state.(*stateDriver)
+	require.True(t, ok)
+
+	// set every field in driverSpec
+	driverSpec := &nvidiav1alpha1.NVIDIADriverSpec{
+		Manager: nvidiav1alpha1.DriverManagerSpec{
+			Repository:       "/path/to/repository",
+			Image:            "image",
+			Version:          "version",
+			ImagePullPolicy:  "Always",
+			ImagePullSecrets: []string{"manager-secret"},
+			Env: []nvidiav1alpha1.EnvVar{
+				{Name: "FOO", Value: "foo"},
+				{Name: "BAR", Value: "bar"},
+			},
+		},
+		StartupProbe:     getDefaultContainerProbeSpec(),
+		LivenessProbe:    getDefaultContainerProbeSpec(),
+		ReadinessProbe:   getDefaultContainerProbeSpec(),
+		UsePrecompiled:   new(bool),
+		ImagePullPolicy:  "Always",
+		ImagePullSecrets: []string{"secret-a", "secret-b"},
+		Resources: &nvidiav1alpha1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("200m"),
+				corev1.ResourceMemory: resource.MustParse("100Mi"),
+			},
+			Limits: corev1.ResourceList{
+				"memory": resource.MustParse("200Mi"),
+				"cpu":    resource.MustParse("500m"),
+			},
+		},
+		Args: []string{"--foo", "--bar"},
+		Env: []nvidiav1alpha1.EnvVar{
+			{Name: "FOO", Value: "foo"},
+			{Name: "BAR", Value: "bar"},
+		},
+		NodeSelector: map[string]string{
+			"example.com/foo": "foo",
+			"example.com/bar": "bar",
+		},
+		Labels: map[string]string{
+			"custom-label-1": "custom-value-1",
+			"custom-label-2": "custom-value-2",
+			// The below standard labels should not be overridden in the
+			// DaemonSet that gets rendered
+			"app":                       "foo",
+			"app.kubernetes.io/part-of": "foo",
+		},
+		Annotations: map[string]string{
+			"custom-annotation-1": "custom-value-1",
+			"custom-annotation-2": "custom-value-2",
+		},
+		Tolerations: []corev1.Toleration{
+			{
+				Key:      "foo",
+				Operator: "Equal",
+				Value:    "bar",
+				Effect:   "NoSchedule",
+			},
+		},
+		PriorityClassName: "custom-priority-class-name",
+		KernelModuleType:  "open",
+	}
+
+	driverSpec.Labels = sanitizeDriverLabels(driverSpec.Labels)
+
+	renderData := getMinimalDriverRenderData()
+	renderData.Driver.Spec = driverSpec
+
+	objs, err := stateDriver.renderer.RenderObjects(
+		&render.TemplatingData{
+			Data: renderData,
+		})
+	require.Nil(t, err)
+
+	actual, err := getYAMLString(objs)
+	require.Nil(t, err)
+
+	o, err := os.ReadFile(filepath.Join(manifestResultDir, testName+".yaml"))
+	require.Nil(t, err)
+
+	require.Equal(t, string(o), actual)
+}
+
+func TestDriverGDS(t *testing.T) {
+	const (
+		testName = "driver-gds"
+	)
+
+	state, err := NewStateDriver(nil, "", nil, manifestDir)
+	require.Nil(t, err)
+	stateDriver, ok := state.(*stateDriver)
+	require.True(t, ok)
+
+	renderData := getMinimalDriverRenderData()
+
+	renderData.AdditionalConfigs = getSampleAdditionalConfigs()
+
+	renderData.GDS = &gdsDriverSpec{
+		ImagePath: "nvcr.io/nvidia/cloud-native/nvidia-fs:2.16.1",
+		Spec: &nvidiav1alpha1.GPUDirectStorageSpec{
+			Enabled:          ptr.To(true),
+			ImagePullSecrets: []string{"ngc-secrets"},
+		},
+	}
+
+	objs, err := stateDriver.renderer.RenderObjects(
+		&render.TemplatingData{
+			Data: renderData,
+		})
+	require.Nil(t, err)
+	require.NotEmpty(t, objs)
+
+	actual, err := getYAMLString(objs)
+	require.Nil(t, err)
+
+	o, err := os.ReadFile(filepath.Join(manifestResultDir, testName+".yaml"))
+	require.Nil(t, err)
+
+	require.Equal(t, string(o), actual)
+}
+
+func TestDriverGDRCopy(t *testing.T) {
+	const (
+		testName = "driver-gdrcopy"
+	)
+
+	state, err := NewStateDriver(nil, "", nil, manifestDir)
+	require.Nil(t, err)
+	stateDriver, ok := state.(*stateDriver)
+	require.True(t, ok)
+
+	renderData := getMinimalDriverRenderData()
+
+	renderData.AdditionalConfigs = getSampleAdditionalConfigs()
+
+	renderData.GDRCopy = &gdrcopyDriverSpec{
+		ImagePath: "nvcr.io/nvidia/cloud-native/gdrdrv:v2.4.1",
+		Spec: &nvidiav1alpha1.GDRCopySpec{
+			Enabled:          ptr.To(true),
+			ImagePullSecrets: []string{"ngc-secrets"},
+		},
+	}
+
+	objs, err := stateDriver.renderer.RenderObjects(
+		&render.TemplatingData{
+			Data: renderData,
+		})
+	require.Nil(t, err)
+	require.NotEmpty(t, objs)
+
+	actual, err := getYAMLString(objs)
+	require.Nil(t, err)
+
+	o, err := os.ReadFile(filepath.Join(manifestResultDir, testName+".yaml"))
+	require.Nil(t, err)
+
+	require.Equal(t, string(o), actual)
+}
+
+func TestDriverGDRCopyOpenShift(t *testing.T) {
+	const (
+		testName     = "driver-gdrcopy-openshift"
+		rhcosVersion = "413.92.202304252344-0"
+		toolkitImage = "quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:7fecaebc1d51b28bc3548171907e4d91823a031d7a6a694ab686999be2b4d867"
+	)
+
+	state, err := NewStateDriver(nil, "", nil, manifestDir)
+	require.Nil(t, err)
+	stateDriver, ok := state.(*stateDriver)
+	require.True(t, ok)
+
+	renderData := getMinimalDriverRenderData()
+	renderData.AdditionalConfigs = getSampleAdditionalConfigs()
+	renderData.Driver.Name = "nvidia-gpu-driver-openshift"
+	renderData.Driver.AppName = "nvidia-gpu-driver-openshift-79d6bd954f"
+	renderData.Driver.ImagePath = "nvcr.io/nvidia/driver:525.85.03-rhel8.0"
+	renderData.Driver.OSVersion = "rhel8.0"
+	renderData.Openshift = &openshiftSpec{
+		ToolkitImage: toolkitImage,
+		RHCOSVersion: rhcosVersion,
+	}
+	renderData.Runtime.OpenshiftDriverToolkitEnabled = true
+	renderData.Runtime.OpenshiftVersion = "4.13"
+	renderData.Runtime.OpenshiftProxySpec = &configv1.ProxySpec{
+		HTTPProxy:  "http://user:pass@example:8080",
+		HTTPSProxy: "https://user:pass@example:8085",
+		NoProxy:    "internal.example.com",
+		TrustedCA: configv1.ConfigMapNameReference{
+			Name: "gpu-operator-trusted-ca",
+		},
+	}
+
+	renderData.GDRCopy = &gdrcopyDriverSpec{
+		ImagePath: "nvcr.io/nvidia/cloud-native/gdrdrv:v2.4.1-rhcos4.13",
+		Spec: &nvidiav1alpha1.GDRCopySpec{
+			Enabled:          ptr.To(true),
+			ImagePullSecrets: []string{"ngc-secret"},
+		},
+	}
+
+	objs, err := stateDriver.renderer.RenderObjects(
+		&render.TemplatingData{
+			Data: renderData,
+		})
+	require.Nil(t, err)
+	require.NotEmpty(t, objs)
+
+	actual, err := getYAMLString(objs)
+	require.Nil(t, err)
+
+	o, err := os.ReadFile(filepath.Join(manifestResultDir, testName+".yaml"))
+	require.Nil(t, err)
+
+	require.Equal(t, string(o), actual)
+}
+
+func TestDriverAdditionalConfigs(t *testing.T) {
+	const (
+		testName = "driver-additional-configs"
+	)
+
+	state, err := NewStateDriver(nil, "", nil, manifestDir)
+	require.Nil(t, err)
+	stateDriver, ok := state.(*stateDriver)
+	require.True(t, ok)
+
+	renderData := getMinimalDriverRenderData()
+
+	renderData.AdditionalConfigs = getSampleAdditionalConfigs()
+
+	objs, err := stateDriver.renderer.RenderObjects(
+		&render.TemplatingData{
+			Data: renderData,
+		})
+	require.Nil(t, err)
+
+	actual, err := getYAMLString(objs)
+	require.Nil(t, err)
+
+	o, err := os.ReadFile(filepath.Join(manifestResultDir, testName+".yaml"))
+	require.Nil(t, err)
+
+	require.Equal(t, string(o), actual)
+}
+
+func TestDriverAdditionalConfigsSubscriptionMounts(t *testing.T) {
+	repoConfigMap := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-repo-config",
+			Namespace: "test-ns",
+		},
+		Data: map[string]string{
+			"redhat.repo": "[test-repo]",
+		},
+	}
+
+	testCases := []struct {
+		description                 string
+		osRelease                   string
+		repoConfigEnabled           bool
+		expectSubscriptionMounts    bool
+		expectedSubscriptionHostMap map[string]corev1.HostPathType
+	}{
+		{
+			description:              "rhel with repo config skips host subscription mounts",
+			osRelease:                "rhel",
+			repoConfigEnabled:        true,
+			expectSubscriptionMounts: false,
+		},
+		{
+			description:              "rhel without repo config mounts host subscription paths",
+			osRelease:                "rhel",
+			expectSubscriptionMounts: true,
+			expectedSubscriptionHostMap: map[string]corev1.HostPathType{
+				"/etc/pki/entitlement":         corev1.HostPathDirectory,
+				"/etc/yum.repos.d/redhat.repo": corev1.HostPathFile,
+				"/etc/rhsm":                    corev1.HostPathDirectory,
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.description, func(t *testing.T) {
+			stateDriver := &stateDriver{
+				stateSkel: stateSkel{
+					client:    fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(repoConfigMap).Build(),
+					namespace: "test-ns",
+				},
+			}
+			driver := &nvidiav1alpha1.NVIDIADriver{}
+			if tc.repoConfigEnabled {
+				driver.Spec.RepoConfig = &nvidiav1alpha1.DriverRepoConfigSpec{Name: "test-repo-config"}
+			}
+
+			configs, err := stateDriver.getDriverAdditionalConfigs(
+				context.Background(),
+				driver,
+				testClusterInfo{runtime: consts.Containerd},
+				nodePool{osRelease: tc.osRelease, osVersion: tc.osRelease},
+			)
+			require.NoError(t, err)
+
+			assertSubscriptionHostPathVolumes(t, configs.Volumes, tc.expectedSubscriptionHostMap)
+			assert.Equal(t, tc.expectSubscriptionMounts, hasSubscriptionVolumeMount(configs.VolumeMounts))
+		})
+	}
+}
+
+func TestDriverConfigPathHelpers(t *testing.T) {
+	repoConfigPath, err := getRepoConfigPath("rhel")
+	require.NoError(t, err)
+	assert.Equal(t, "/etc/yum.repos.d", repoConfigPath)
+
+	certConfigPath, err := getCertConfigPath("rhcos")
+	require.NoError(t, err)
+	assert.Equal(t, "/etc/pki/ca-trust/extracted/pem", certConfigPath)
+
+	subscriptionPaths, err := getSubscriptionPathsToVolumeSources("rhel")
+	require.NoError(t, err)
+	assert.Contains(t, subscriptionPaths, "/run/secrets/etc-pki-entitlement")
+	assert.Contains(t, subscriptionPaths, "/run/secrets/redhat.repo")
+	assert.Contains(t, subscriptionPaths, "/run/secrets/rhsm")
+
+	_, err = getRepoConfigPath("unsupported")
+	require.ErrorContains(t, err, "distribution unsupported not supported")
+
+	_, err = getCertConfigPath("unsupported")
+	require.ErrorContains(t, err, "distribution unsupported not supported")
+
+	_, err = getSubscriptionPathsToVolumeSources("unsupported")
+	require.ErrorContains(t, err, "distribution unsupported not supported")
+}
+
+func TestDriverOpenshiftDriverToolkit(t *testing.T) {
+	const (
+		testName     = "driver-openshift-drivertoolkit"
+		rhcosVersion = "413.92.202304252344-0"
+		toolkitImage = "quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:7fecaebc1d51b28bc3548171907e4d91823a031d7a6a694ab686999be2b4d867"
+	)
+
+	state, err := NewStateDriver(nil, "", nil, manifestDir)
+	require.Nil(t, err)
+	stateDriver, ok := state.(*stateDriver)
+	require.True(t, ok)
+
+	renderData := getMinimalDriverRenderData()
+	renderData.Driver.Name = "nvidia-gpu-driver-openshift"
+	renderData.Driver.AppName = "nvidia-gpu-driver-openshift-79d6bd954f"
+	renderData.Driver.ImagePath = "nvcr.io/nvidia/driver:525.85.03-rhel8.0"
+	renderData.Driver.OSVersion = "rhel8.0"
+	renderData.Openshift = &openshiftSpec{
+		ToolkitImage: toolkitImage,
+		RHCOSVersion: rhcosVersion,
+	}
+	renderData.Runtime.OpenshiftDriverToolkitEnabled = true
+	renderData.Runtime.OpenshiftVersion = "4.13"
+	renderData.Runtime.OpenshiftProxySpec = &configv1.ProxySpec{
+		HTTPProxy:  "http://user:pass@example:8080",
+		HTTPSProxy: "https://user:pass@example:8085",
+		NoProxy:    "internal.example.com",
+		TrustedCA: configv1.ConfigMapNameReference{
+			Name: "gpu-operator-trusted-ca",
+		},
+	}
+
+	objs, err := stateDriver.renderer.RenderObjects(
+		&render.TemplatingData{
+			Data: renderData,
+		})
+	require.Nil(t, err)
+
+	actual, err := getYAMLString(objs)
+	require.Nil(t, err)
+
+	o, err := os.ReadFile(filepath.Join(manifestResultDir, testName+".yaml"))
+	require.Nil(t, err)
+
+	require.Equal(t, string(o), actual)
+}
+
+func TestGetNodePoolsDoesNotAllowSelectorToOverrideOwnerLabel(t *testing.T) {
+	require.NoError(t, corev1.AddToScheme(scheme.Scheme))
+
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+		Name: "gpu-node",
+		Labels: map[string]string{
+			consts.GPUPresentLabel:                "true",
+			nvidiav1alpha1.NVIDIADriverOwnerLabel: "driver-a",
+			nfdOSReleaseIDLabelKey:                "ubuntu",
+			nfdOSVersionIDLabelKey:                "22.04",
+		},
+	}}
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(node).Build()
+	driver := &nvidiav1alpha1.NVIDIADriver{
+		ObjectMeta: metav1.ObjectMeta{Name: "driver-a"},
+		Spec: nvidiav1alpha1.NVIDIADriverSpec{
+			NodeSelector: map[string]string{nvidiav1alpha1.NVIDIADriverOwnerLabel: "driver-b"},
+		},
+	}
+
+	nodePools, err := getNodePools(context.Background(), k8sClient, driver, false)
+
+	require.NoError(t, err)
+	require.Len(t, nodePools, 1)
+	require.Equal(t, "driver-a", nodePools[0].nodeSelector[nvidiav1alpha1.NVIDIADriverOwnerLabel])
+}
+
+func TestDriverPrecompiled(t *testing.T) {
+	const (
+		testName = "driver-precompiled"
+	)
+
+	state, err := NewStateDriver(nil, "", nil, manifestDir)
+	require.Nil(t, err)
+	stateDriver, ok := state.(*stateDriver)
+	require.True(t, ok)
+
+	renderData := getMinimalDriverRenderData()
+	renderData.Driver.Spec.UsePrecompiled = ptr.To(true)
+	renderData.Driver.Name = "nvidia-gpu-driver-ubuntu22.04"
+	renderData.Driver.AppName = "nvidia-gpu-driver-ubuntu22.04-646cdfdb96"
+	renderData.Driver.ImagePath = "nvcr.io/nvidia/driver:535-5.4.0-150-generic-ubuntu22.04"
+	renderData.Precompiled = &precompiledSpec{
+		KernelVersion:          "5.4.0-150-generic",
+		SanitizedKernelVersion: "5.4.0-150-generic",
+	}
+
+	objs, err := stateDriver.renderer.RenderObjects(
+		&render.TemplatingData{
+			Data: renderData,
+		})
+	require.Nil(t, err)
+
+	actual, err := getYAMLString(objs)
+	require.Nil(t, err)
+
+	o, err := os.ReadFile(filepath.Join(manifestResultDir, testName+".yaml"))
+	require.Nil(t, err)
+
+	require.Equal(t, string(o), actual)
+}
+
+func TestGetDriverAppName(t *testing.T) {
+	cr := &nvidiav1alpha1.NVIDIADriver{
+		ObjectMeta: metav1.ObjectMeta{
+			UID: apitypes.UID("bfac7359-6033-45ce-88d6-53db0078526e"),
+		},
+		Spec: nvidiav1alpha1.NVIDIADriverSpec{
+			DriverType: nvidiav1alpha1.GPU,
+		},
+	}
+
+	pool := nodePool{
+		osRelease: "ubuntu",
+		osVersion: "20.04",
+	}
+	var err error
+	pool.osTag, err = getOSTag(pool.osRelease, pool.osVersion)
+	assert.NoError(t, err)
+
+	actual := getDriverAppName(cr, pool)
+	expected := "nvidia-gpu-driver-ubuntu20.04-67cc6dbb79"
+	assert.Equal(t, expected, actual)
+
+	// Modify nodePool to include kernelVersion
+	pool.kernel = "5.15.0-70-generic"
+
+	actual = getDriverAppName(cr, pool)
+	expected = "nvidia-gpu-driver-ubuntu20.04-59b779bcc5"
+	assert.Equal(t, expected, actual)
+
+	// Now set the osVersion to a really long string
+	pool.osRelease = "redhatCoreOS"
+	pool.osVersion = "4.14-414.92.202309282257"
+	pool.osTag, err = getOSTag(pool.osRelease, pool.osVersion)
+	assert.NoError(t, err)
+
+	actual = getDriverAppName(cr, pool)
+	expected = "nvidia-gpu-driver-redhatCoreOS4.14-414.92.2023092822-59b779bcc5"
+	assert.Equal(t, expected, actual)
+	assert.Equal(t, 63, len(actual))
+
+	// RockyLinux
+	pool.osRelease = "rocky"
+	pool.osVersion = "9.6"
+	pool.osTag, err = getOSTag(pool.osRelease, pool.osVersion)
+	assert.NoError(t, err)
+	actual = getDriverAppName(cr, pool)
+	assert.Equal(t, "nvidia-gpu-driver-rocky9-59b779bcc5", actual)
+
+	// Oracle Linux
+	pool.osRelease = "ol"
+	pool.osVersion = "9.7"
+	pool.osTag, err = getOSTag(pool.osRelease, pool.osVersion)
+	assert.NoError(t, err)
+	actual = getDriverAppName(cr, pool)
+	assert.Equal(t, "nvidia-gpu-driver-ol9-59b779bcc5", actual)
+
+	// RHEL10
+	pool.osRelease = "rhel"
+	pool.osVersion = "10.1"
+	pool.osTag, err = getOSTag(pool.osRelease, pool.osVersion)
+	assert.NoError(t, err)
+	actual = getDriverAppName(cr, pool)
+	assert.Equal(t, "nvidia-gpu-driver-rhel10-59b779bcc5", actual)
+}
+
+func TestGetDriverAppNameRHCOS(t *testing.T) {
+	cr := &nvidiav1alpha1.NVIDIADriver{
+		ObjectMeta: metav1.ObjectMeta{
+			UID: apitypes.UID("d5b3a1f2-38a9-4b72-bff1-21fd569fd305"),
+		},
+		Spec: nvidiav1alpha1.NVIDIADriverSpec{
+			DriverType: nvidiav1alpha1.GPU,
+		},
+	}
+
+	pool := nodePool{
+		osRelease:    "rhcos",
+		osVersion:    "4.14",
+		rhcosVersion: "414.92.202309282257",
+	}
+	var err error
+	pool.osTag, err = getOSTag(pool.osRelease, pool.osVersion)
+	assert.NoError(t, err)
+
+	actual := getDriverAppName(cr, pool)
+	expected := "nvidia-gpu-driver-rhcos4.14-6f4fc4fc6"
+	assert.Equal(t, expected, actual)
+}
+
+func TestVGPUHostManagerDaemonset(t *testing.T) {
+	const (
+		testName = "driver-vgpu-host-manager"
+	)
+	state, err := NewStateDriver(nil, "", nil, manifestDir)
+	require.Nil(t, err)
+	stateDriver, ok := state.(*stateDriver)
+	require.True(t, ok)
+
+	renderData := getMinimalDriverRenderData()
+	renderData.Driver.Spec.DriverType = nvidiav1alpha1.VGPUHostManager
+	renderData.Driver.Name = "nvidia-vgpu-manager-ubuntu22.04"
+	renderData.Driver.AppName = "nvidia-vgpu-manager-ubuntu22.04-7c6d7bd86b"
+	renderData.Driver.ImagePath = "nvcr.io/nvidia/vgpu-manager:525.85.03-ubuntu22.04"
+
+	objs, err := stateDriver.renderer.RenderObjects(
+		&render.TemplatingData{
+			Data: renderData,
+		})
+	require.Nil(t, err)
+
+	actual, err := getYAMLString(objs)
+	require.Nil(t, err)
+
+	o, err := os.ReadFile(filepath.Join(manifestResultDir, testName+".yaml"))
+	require.Nil(t, err)
+
+	require.Equal(t, string(o), actual)
+}
+
+func TestVGPUHostManagerDaemonsetOpenShift(t *testing.T) {
+	const (
+		testName     = "driver-vgpu-host-manager-openshift"
+		rhcosVersion = "413.92.202304252344-0"
+		toolkitImage = "quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:7fecaebc1d51b28bc3548171907e4d91823a031d7a6a694ab686999be2b4d867"
+	)
+	state, err := NewStateDriver(nil, "", nil, manifestDir)
+	require.Nil(t, err)
+	stateDriver, ok := state.(*stateDriver)
+	require.True(t, ok)
+
+	renderData := getMinimalDriverRenderData()
+	renderData.Driver.Spec.DriverType = nvidiav1alpha1.VGPUHostManager
+	renderData.Driver.Name = "nvidia-vgpu-manager-openshift"
+	renderData.Driver.AppName = "nvidia-vgpu-manager-openshift-7c6d7bd86b"
+	renderData.Driver.ImagePath = "nvcr.io/nvidia/vgpu-manager:525.85.03-rhel8.0"
+	renderData.Driver.OSVersion = "rhel8.0"
+	renderData.Openshift = &openshiftSpec{
+		ToolkitImage: toolkitImage,
+		RHCOSVersion: rhcosVersion,
+	}
+	renderData.Runtime.OpenshiftDriverToolkitEnabled = true
+	renderData.Runtime.OpenshiftVersion = "4.13"
+
+	objs, err := stateDriver.renderer.RenderObjects(
+		&render.TemplatingData{
+			Data: renderData,
+		})
+	require.Nil(t, err)
+
+	actual, err := getYAMLString(objs)
+	require.Nil(t, err)
+
+	o, err := os.ReadFile(filepath.Join(manifestResultDir, testName+".yaml"))
+	require.Nil(t, err)
+
+	require.Equal(t, string(o), actual)
+}
+
+func getMinimalDriverRenderData() *driverRenderData {
+	return &driverRenderData{
+		Driver: &driverSpec{
+			Spec: &nvidiav1alpha1.NVIDIADriverSpec{
+				StartupProbe:   getDefaultContainerProbeSpec(),
+				LivenessProbe:  getDefaultContainerProbeSpec(),
+				ReadinessProbe: getDefaultContainerProbeSpec(),
+				DriverType:     nvidiav1alpha1.GPU,
+				Resources: &nvidiav1alpha1.ResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("200m"),
+						corev1.ResourceMemory: resource.MustParse("100Mi"),
+					},
+					Limits: corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("500m"),
+						corev1.ResourceMemory: resource.MustParse("300Mi"),
+					},
+				},
+			},
+			AppName:          "nvidia-gpu-driver-ubuntu22.04-7c6d7bd86b",
+			Name:             "nvidia-gpu-driver-ubuntu22.04",
+			ImagePath:        "nvcr.io/nvidia/driver:525.85.03-ubuntu22.04",
+			ManagerImagePath: "nvcr.io/nvidia/cloud-native/k8s-driver-manager:devel",
+			OSVersion:        "ubuntu22.04",
+		},
+		Runtime: &driverRuntimeSpec{
+			Namespace: "test-operator",
+		},
+		HostRoot: "",
+	}
+}
+
+func getDefaultContainerProbeSpec() *nvidiav1alpha1.ContainerProbeSpec {
+	return &nvidiav1alpha1.ContainerProbeSpec{
+		InitialDelaySeconds: 60,
+		TimeoutSeconds:      60,
+		PeriodSeconds:       10,
+		SuccessThreshold:    1,
+		FailureThreshold:    120,
+	}
+}
+
+func getSampleAdditionalConfigs() *additionalConfigs {
+	return &additionalConfigs{
+		VolumeMounts: []corev1.VolumeMount{
+			{
+				Name:      "test-cm",
+				ReadOnly:  true,
+				MountPath: "/opt/config/test-file",
+				SubPath:   "test-file",
+			},
+			{
+				Name:      "test-host-path",
+				MountPath: "/opt/config/test-host-path",
+			},
+			{
+				Name:      "test-host-path-ro",
+				MountPath: "/opt/config/test-host-path-ro",
+				ReadOnly:  true,
+			},
+		},
+		Volumes: []corev1.Volume{
+			{
+				Name: "test-cm",
+				VolumeSource: corev1.VolumeSource{
+					ConfigMap: &corev1.ConfigMapVolumeSource{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: "test-cm",
+						},
+						Items: []corev1.KeyToPath{
+							{
+								Key:  "test-file",
+								Path: "test-file",
+							},
+						},
+					},
+				},
+			},
+			{
+				Name: "test-host-path",
+				VolumeSource: corev1.VolumeSource{
+					HostPath: &corev1.HostPathVolumeSource{
+						Path: "/opt/config/test-host-path",
+						Type: ptr.To(corev1.HostPathDirectoryOrCreate),
+					},
+				},
+			},
+			{
+				Name: "test-host-path-ro",
+				VolumeSource: corev1.VolumeSource{
+					HostPath: &corev1.HostPathVolumeSource{
+						Path: "/opt/config/test-host-path-ro",
+						Type: ptr.To(corev1.HostPathDirectoryOrCreate),
+					},
+				},
+			},
+		},
+	}
+}
+
+func TestDriverVGPULicensing(t *testing.T) {
+	const (
+		testName = "driver-vgpu-licensing"
+	)
+
+	state, err := NewStateDriver(nil, "", nil, manifestDir)
+	require.Nil(t, err)
+	stateDriver, ok := state.(*stateDriver)
+	require.True(t, ok)
+
+	renderData := getMinimalDriverRenderData()
+
+	renderData.AdditionalConfigs = &additionalConfigs{
+		VolumeMounts: []corev1.VolumeMount{
+			{
+				Name:      "licensing-config",
+				MountPath: "/drivers/gridd.conf",
+				SubPath:   "gridd.conf",
+			},
+			{
+				Name:      "licensing-config",
+				MountPath: "/drivers/ClientConfigToken/client_configuration_token.tok",
+				SubPath:   "client_configuration_token.tok",
+			},
+		},
+		Volumes: []corev1.Volume{
+			{
+				Name: "licensing-config",
+				VolumeSource: corev1.VolumeSource{
+					ConfigMap: &corev1.ConfigMapVolumeSource{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: "licensing-config-configmap",
+						},
+						Items: []corev1.KeyToPath{
+							{
+								Key:  "gridd.conf",
+								Path: "gridd.conf",
+							},
+							{
+								Key:  "client_configuration_token.tok",
+								Path: "client_configuration_token.tok",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	objs, err := stateDriver.renderer.RenderObjects(
+		&render.TemplatingData{
+			Data: renderData,
+		})
+	require.Nil(t, err)
+
+	actual, err := getYAMLString(objs)
+	require.Nil(t, err)
+
+	o, err := os.ReadFile(filepath.Join(manifestResultDir, testName+".yaml"))
+	require.Nil(t, err)
+
+	require.Equal(t, string(o), actual)
+
+}
+
+func TestDriverVGPULicensingSecret(t *testing.T) {
+	const (
+		testName = "driver-vgpu-licensing-secret"
+	)
+
+	state, err := NewStateDriver(nil, "", nil, manifestDir)
+	require.Nil(t, err)
+	stateDriver, ok := state.(*stateDriver)
+	require.True(t, ok)
+
+	renderData := getMinimalDriverRenderData()
+
+	renderData.Driver.Spec.LicensingConfig = &nvidiav1alpha1.DriverLicensingConfigSpec{
+		SecretName: "licensing-config-secret",
+		NLSEnabled: ptr.To(true),
+	}
+
+	renderData.AdditionalConfigs = &additionalConfigs{
+		VolumeMounts: []corev1.VolumeMount{
+			{
+				Name:      "licensing-config",
+				MountPath: "/drivers/gridd.conf",
+				SubPath:   "gridd.conf",
+			},
+			{
+				Name:      "licensing-config",
+				MountPath: "/drivers/ClientConfigToken/client_configuration_token.tok",
+				SubPath:   "client_configuration_token.tok",
+			},
+		},
+		Volumes: []corev1.Volume{
+			{
+				Name: "licensing-config",
+				VolumeSource: corev1.VolumeSource{
+					Secret: &corev1.SecretVolumeSource{
+						SecretName: "licensing-config-secret",
+						Items: []corev1.KeyToPath{
+							{
+								Key:  "gridd.conf",
+								Path: "gridd.conf",
+							},
+							{
+								Key:  "client_configuration_token.tok",
+								Path: "client_configuration_token.tok",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	objs, err := stateDriver.renderer.RenderObjects(
+		&render.TemplatingData{
+			Data: renderData,
+		})
+	require.Nil(t, err)
+
+	actual, err := getYAMLString(objs)
+	require.Nil(t, err)
+
+	o, err := os.ReadFile(filepath.Join(manifestResultDir, testName+".yaml"))
+	require.Nil(t, err)
+
+	require.Equal(t, string(o), actual)
+
+}
+
+func TestDriverSecretEnv(t *testing.T) {
+	const (
+		testName = "driver-secret-env"
+	)
+
+	state, err := NewStateDriver(nil, "", nil, manifestDir)
+	require.Nil(t, err)
+	stateDriver, ok := state.(*stateDriver)
+	require.True(t, ok)
+
+	renderData := getMinimalDriverRenderData()
+	renderData.Driver.Spec.SecretEnv = "test-secret-env"
+	renderData.GDS = &gdsDriverSpec{
+		ImagePath: "nvcr.io/nvidia/cloud-native/nvidia-fs:2.16.1",
+		Spec: &nvidiav1alpha1.GPUDirectStorageSpec{
+			Enabled: ptr.To(true),
+		},
+	}
+	renderData.GDRCopy = &gdrcopyDriverSpec{
+		ImagePath: "nvcr.io/nvidia/cloud-native/gdrdrv:v2.4.1",
+		Spec: &nvidiav1alpha1.GDRCopySpec{
+			Enabled: ptr.To(true),
+		},
+	}
+
+	objs, err := stateDriver.renderer.RenderObjects(
+		&render.TemplatingData{
+			Data: renderData,
+		})
+	require.Nil(t, err)
+
+	actual, err := getYAMLString(objs)
+	require.Nil(t, err)
+
+	o, err := os.ReadFile(filepath.Join(manifestResultDir, testName+".yaml"))
+	require.Nil(t, err)
+
+	require.Equal(t, string(o), actual)
+
+}
+
+func TestGetSanitizedKernelVersion(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"5.14.0-427.37.1.el9_4.aarch64_64k", "5.14.0-427.37.1.el9.4"},
+		{"5.14.0-427.37.1.el9_4.aarch64", "5.14.0-427.37.1.el9.4"},
+		{"5.14.0-427.37.1.el9_4.x86_64_64k", "5.14.0-427.37.1.el9.4"},
+		{"5.14.0-427.37.1.el9_4.x86_64", "5.14.0-427.37.1.el9.4"},
+	}
+
+	for _, test := range tests {
+		result := getSanitizedKernelVersion(test.input)
+		require.NotEmpty(t, result)
+		require.Equal(t, test.expected, result)
+	}
+}
+
+func TestGetDriverSpecMultipleNodePools(t *testing.T) {
+	cr := &nvidiav1alpha1.NVIDIADriver{
+		ObjectMeta: metav1.ObjectMeta{
+			UID: apitypes.UID("test-uid-multipools"),
+		},
+		Spec: nvidiav1alpha1.NVIDIADriverSpec{
+			DriverType:     nvidiav1alpha1.GPU,
+			UsePrecompiled: ptr.To(true),
+			Repository:     "nvcr.io/nvidia",
+			Image:          "driver",
+			Version:        "535.104.05",
+			Manager: nvidiav1alpha1.DriverManagerSpec{
+				Repository: "nvcr.io/nvidia/cloud-native",
+				Image:      "k8s-driver-manager",
+				Version:    "v0.6.2",
+			},
+		},
+	}
+
+	pool1 := nodePool{
+		osRelease: "ubuntu",
+		osVersion: "22.04",
+		kernel:    "5.15.0-generic",
+		nodeSelector: map[string]string{
+			"feature.node.kubernetes.io/kernel-version.full":          "5.15.0-generic",
+			"feature.node.kubernetes.io/system-os_release.VERSION_ID": "22.04",
+		},
+	}
+
+	var err error
+	pool1.osTag, err = getOSTag(pool1.osRelease, pool1.osVersion)
+	require.NoError(t, err)
+
+	pool2 := nodePool{
+		osRelease: "ubuntu",
+		osVersion: "20.04",
+		kernel:    "5.4.0-generic",
+		nodeSelector: map[string]string{
+			"feature.node.kubernetes.io/kernel-version.full":          "5.4.0-generic",
+			"feature.node.kubernetes.io/system-os_release.VERSION_ID": "20.04",
+		},
+	}
+
+	pool2.osTag, err = getOSTag(pool2.osRelease, pool2.osVersion)
+	require.NoError(t, err)
+
+	spec1, err := getDriverSpec(cr, pool1)
+	require.NoError(t, err)
+	spec2, err := getDriverSpec(cr, pool2)
+	require.NoError(t, err)
+
+	// Verify each spec has correct values
+	assert.Equal(t, "nvcr.io/nvidia/driver:535.104.05-5.15.0-generic-ubuntu22.04", spec1.ImagePath)
+	assert.Equal(t, "nvcr.io/nvidia/driver:535.104.05-5.4.0-generic-ubuntu20.04", spec2.ImagePath)
+	assert.Equal(t, "ubuntu22.04", spec1.OSVersion)
+	assert.Equal(t, "ubuntu20.04", spec2.OSVersion)
+
+	// Verify NodeSelectors are independent
+	assert.Equal(t, "5.15.0-generic", spec1.Spec.NodeSelector["feature.node.kubernetes.io/kernel-version.full"])
+	assert.Equal(t, "5.4.0-generic", spec2.Spec.NodeSelector["feature.node.kubernetes.io/kernel-version.full"])
+
+	// Verify specs have independent pointers
+	assert.NotEqual(t, spec1.Spec, spec2.Spec)
+
+	// Verify modifying one doesn't affect the other
+	spec1.Spec.NodeSelector["test-key"] = "test-value"
+	_, exists := spec2.Spec.NodeSelector["test-key"]
+	assert.False(t, exists)
+}
