@@ -5,18 +5,19 @@ version: 2
 updates:
   - package-ecosystem: "gomod"
     target-branch: main
-    directory: "/"
+    directories:
+      - "/"
+      - "/api"
     schedule:
       interval: "daily"
     open-pull-requests-limit: 10
     labels:
       - dependencies
     groups:
-      k8sio:
+      cross-module-dependencies:
         patterns:
-          - k8s.io/*
-        exclude-patterns:
-          - k8s.io/klog/*
+          - "*"
+        group-by: dependency-name
 
   - package-ecosystem: "gomod"
     target-branch: main
