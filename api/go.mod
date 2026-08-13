@@ -8,7 +8,7 @@ require (
 	github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring v0.93.0
 	github.com/regclient/regclient v0.11.5
 	github.com/stretchr/testify v1.11.1
-	golang.org/x/mod v0.38.0
+	golang.org/x/mod v0.39.0
 	k8s.io/api v0.36.3
 	k8s.io/apimachinery v0.36.3
 	k8s.io/client-go v0.36.3
