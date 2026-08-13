@@ -1,0 +1,77 @@
+name: Verify Shared Dependency Versions
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-shared-dependencies:
+    name: Shared dependencies are in sync
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Compare shared direct dependencies
+        shell: bash
+        run: |
+          python3 <<'PY'
+          import json
+          import subprocess
+          import sys
+
+
+          def direct_dependencies(directory):
+              output = subprocess.check_output(
+                  ["go", "mod", "edit", "-json"],
+                  cwd=directory,
+                  text=True,
+              )
+              go_mod = json.loads(output)
+              return {
+                  requirement["Path"]: requirement["Version"]
+                  for requirement in go_mod.get("Require", [])
+                  if not requirement.get("Indirect", False)
+              }
+
+
+          root_dependencies = direct_dependencies(".")
+          api_dependencies = direct_dependencies("api")
+          shared_dependencies = sorted(root_dependencies.keys() & api_dependencies.keys())
+
+          mismatches = []
+          for dependency in shared_dependencies:
+              root_version = root_dependencies[dependency]
+              api_version = api_dependencies[dependency]
+              if root_version != api_version:
+                  mismatches.append((dependency, root_version, api_version))
+              else:
+                  print(f"{dependency}: {root_version}")
+
+          if mismatches:
+              for dependency, root_version, api_version in mismatches:
+                  print(
+                      "::error::Shared dependency version mismatch: "
+                      f"{dependency} is {root_version} in go.mod and "
+                      f"{api_version} in api/go.mod"
+                  )
+              sys.exit(1)
+
+          print(
+              f"Verified {len(shared_dependencies)} shared direct dependencies "
+              "have matching versions."
+          )
+          PY
