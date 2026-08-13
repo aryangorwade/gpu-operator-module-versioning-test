@@ -3,19 +3,13 @@ package gpuoperator_test
 import (
 	"archive/tar"
 	"bytes"
-	"encoding/json"
 	"io"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
-	"time"
-
-	"golang.org/x/mod/module"
-	modzip "golang.org/x/mod/zip"
 )
 
 const (
@@ -118,8 +112,7 @@ func TestOperatorImportsReleasedAPIModule(t *testing.T) {
 func TestReleasedAPIModuleCanBeImported(t *testing.T) {
 	localTagCommit(t, apiTag)
 
-	proxyDir := t.TempDir()
-	createAPIProxy(t, proxyDir, extractTaggedAPI(t))
+	apiDir := extractTaggedAPI(t)
 
 	consumerDir := t.TempDir()
 	writeFile(t, filepath.Join(consumerDir, "go.mod"), `module example.com/gpu-operator-api-consumer
@@ -127,6 +120,8 @@ func TestReleasedAPIModuleCanBeImported(t *testing.T) {
 go 1.26.3
 
 require `+apiModulePath+` `+apiVersion+`
+
+replace `+apiModulePath+` => `+apiDir+`
 `)
 	writeFile(t, filepath.Join(consumerDir, "main.go"), `package main
 
@@ -146,14 +141,8 @@ func main() {
 }
 `)
 
-	proxyURL := (&url.URL{Scheme: "file", Path: proxyDir}).String()
 	cmd := exec.Command("go", "run", "-mod=mod", ".")
 	cmd.Dir = consumerDir
-	cmd.Env = append(os.Environ(),
-		"GONOSUMDB="+apiModulePath,
-		"GONOPROXY=",
-		"GOPROXY="+proxyURL+",https://proxy.golang.org,direct",
-	)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -238,46 +227,6 @@ func assertPublishedTag(t *testing.T, tag string) {
 func localTagCommit(t *testing.T, tag string) string {
 	t.Helper()
 	return gitOutput(t, "rev-list", "-n", "1", tag)
-}
-
-func createAPIProxy(t *testing.T, proxyDir, apiDir string) {
-	t.Helper()
-	escapedPath, err := module.EscapePath(apiModulePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	versionDir := filepath.Join(proxyDir, filepath.FromSlash(escapedPath), "@v")
-	if err := os.MkdirAll(versionDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	goMod, err := os.ReadFile(filepath.Join(apiDir, "go.mod"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	writeFile(t, filepath.Join(versionDir, apiVersion+".mod"), string(goMod))
-	writeFile(t, filepath.Join(versionDir, "list"), apiVersion+"\n")
-
-	info, err := json.Marshal(struct {
-		Version string
-		Time    time.Time
-	}{Version: apiVersion, Time: time.Now().UTC()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	writeFile(t, filepath.Join(versionDir, apiVersion+".info"), string(info))
-
-	zipFile, err := os.Create(filepath.Join(versionDir, apiVersion+".zip"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := modzip.CreateFromDir(zipFile, module.Version{Path: apiModulePath, Version: apiVersion}, apiDir); err != nil {
-		zipFile.Close()
-		t.Fatal(err)
-	}
-	if err := zipFile.Close(); err != nil {
-		t.Fatal(err)
-	}
 }
 
 func findBuildInfoLine(t *testing.T, output, prefix string) string {
