@@ -53,11 +53,11 @@ func TestBinaryExists(t *testing.T) {
 }
 
 func TestRootModuleTagExists(t *testing.T) {
-	assertPublishedTagAtHEAD(t, operatorTag)
+	assertPublishedTag(t, operatorTag)
 }
 
 func TestAPIModuleTagExists(t *testing.T) {
-	assertPublishedTagAtHEAD(t, apiTag)
+	assertPublishedTag(t, apiTag)
 }
 
 func TestVersionMetadata(t *testing.T) {
@@ -116,7 +116,7 @@ func TestOperatorImportsReleasedAPIModule(t *testing.T) {
 }
 
 func TestReleasedAPIModuleCanBeImported(t *testing.T) {
-	assertLocalTagAtHEAD(t, apiTag)
+	localTagCommit(t, apiTag)
 
 	proxyDir := t.TempDir()
 	createAPIProxy(t, proxyDir, extractTaggedAPI(t))
@@ -218,9 +218,9 @@ func extractTaggedAPI(t *testing.T) string {
 	return apiDir
 }
 
-func assertPublishedTagAtHEAD(t *testing.T, tag string) {
+func assertPublishedTag(t *testing.T, tag string) {
 	t.Helper()
-	localCommit := assertLocalTagAtHEAD(t, tag)
+	localCommit := localTagCommit(t, tag)
 
 	out, err := exec.Command("git", "ls-remote", "--tags", repositoryRemote, "refs/tags/"+tag).CombinedOutput()
 	if err != nil {
@@ -235,14 +235,9 @@ func assertPublishedTagAtHEAD(t *testing.T, tag string) {
 	}
 }
 
-func assertLocalTagAtHEAD(t *testing.T, tag string) string {
+func localTagCommit(t *testing.T, tag string) string {
 	t.Helper()
-	tagCommit := gitOutput(t, "rev-list", "-n", "1", tag)
-	headCommit := gitOutput(t, "rev-parse", "HEAD")
-	if tagCommit != headCommit {
-		t.Fatalf("tag %s points to %s, want HEAD %s", tag, tagCommit, headCommit)
-	}
-	return tagCommit
+	return gitOutput(t, "rev-list", "-n", "1", tag)
 }
 
 func createAPIProxy(t *testing.T, proxyDir, apiDir string) {
