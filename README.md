@@ -17,6 +17,9 @@ module with Git tag `api/v0.8.0`.
 - the operator dependency graph imports the released API module; and
 - an external consumer can build and use the API from its tagged contents.
 
+The `Verify Required API Tag` CI workflow checks that the API version required
+by the root `go.mod` has a corresponding `api/v*` tag in this repository.
+
 ## Running
 
 Requires Go 1.26.3 and access to the repository's `origin` remote.
