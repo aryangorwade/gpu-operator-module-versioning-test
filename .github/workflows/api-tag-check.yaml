@@ -1,45 +1,56 @@
-name: Verify Required API Tag
+name: Verify Unreleased API Version
 
 on:
   pull_request:
-  push:
-    branches:
-      - main
-  workflow_dispatch:
+    paths:
+      - go.mod
 
 permissions:
   contents: read
 
 jobs:
   verify-api-tag:
-    name: Required API tag exists
+    name: Referenced API tag does not exist
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           persist-credentials: false
 
-      - name: Install Go
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-
-      - name: Verify required API tag
+      - name: Verify changed API version is unreleased
         shell: bash
         run: |
           set -euo pipefail
 
           api_module="github.com/NVIDIA/gpu-operator/api"
-          api_version="$(go list -m -mod=mod -f '{{.Version}}' "${api_module}")"
+          api_version="$(awk -v module="${api_module}" '$1 == module { print $2; exit }' go.mod)"
+          base_version="$(
+            git show "${{ github.event.pull_request.base.sha }}:go.mod" |
+              awk -v module="${api_module}" '$1 == module { print $2; exit }'
+          )"
+
+          if [[ -z "${api_version}" || -z "${base_version}" ]]; then
+            echo "::error::Could not read ${api_module} from the root go.mod"
+            exit 1
+          fi
+
+          if [[ "${api_version}" == "${base_version}" ]]; then
+            echo "${api_module} remains at ${api_version}; no release check is needed."
+            exit 0
+          fi
+
           api_tag="api/${api_version}"
           repository_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
 
-          echo "Root module requires ${api_module} ${api_version}"
-          echo "Checking for ${api_tag} in ${repository_url}"
+          echo "Root module changes ${api_module} from ${base_version} to ${api_version}"
+          echo "Confirming ${api_tag} is not already published in ${repository_url}"
 
-          if ! git ls-remote --exit-code --tags \
+          if git ls-remote --exit-code --tags \
             "${repository_url}" "refs/tags/${api_tag}" >/dev/null; then
-            echo "::error::Required API tag ${api_tag} does not exist in ${repository_url}"
+            echo "::error::API tag ${api_tag} already exists in ${repository_url}"
             exit 1
           fi
+
+          echo "Verified that ${api_tag} is available for the upcoming release."
