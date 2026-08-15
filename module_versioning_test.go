@@ -15,13 +15,15 @@ import (
 const (
 	operatorModulePath = "github.com/NVIDIA/gpu-operator"
 	apiModulePath      = "github.com/NVIDIA/gpu-operator/api"
-	operatorTag        = "v26.3.3"
-	apiTag             = "api/v0.2603.3"
-	apiVersion         = "v0.2603.3"
 	repositoryRemote   = "origin"
 )
 
-var operatorBinaryPath string
+var (
+	operatorTag        = envOrDefault("GPU_OPERATOR_TAG", "v26.3.3")
+	apiTag             = envOrDefault("GPU_OPERATOR_API_TAG", "api/v0.2603.3")
+	apiVersion         = envOrDefault("GPU_OPERATOR_API_VERSION", "v0.2603.3")
+	operatorBinaryPath string
+)
 
 func TestMain(m *testing.M) {
 	tmpDir, err := os.MkdirTemp("", "gpu-operator-versioning-test-*")
@@ -262,4 +264,11 @@ func writeFile(t *testing.T, path, contents string) {
 	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func envOrDefault(name, fallback string) string {
+	if value := os.Getenv(name); value != "" {
+		return value
+	}
+	return fallback
 }
