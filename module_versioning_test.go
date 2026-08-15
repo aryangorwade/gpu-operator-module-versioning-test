@@ -16,8 +16,8 @@ const (
 	operatorModulePath = "github.com/NVIDIA/gpu-operator"
 	apiModulePath      = "github.com/NVIDIA/gpu-operator/api"
 	operatorTag        = "v26.3.3"
-	apiTag             = "api/v0.8.0"
-	apiVersion         = "v0.8.0"
+	apiTag             = "api/v0.2603.3"
+	apiVersion         = "v0.2603.3"
 	repositoryRemote   = "origin"
 )
 
@@ -52,6 +52,14 @@ func TestRootModuleTagExists(t *testing.T) {
 
 func TestAPIModuleTagExists(t *testing.T) {
 	assertPublishedTag(t, apiTag)
+}
+
+func TestReleaseTagsShareCommit(t *testing.T) {
+	operatorCommit := localTagCommit(t, operatorTag)
+	apiCommit := localTagCommit(t, apiTag)
+	if operatorCommit != apiCommit {
+		t.Fatalf("%s points to %s, but %s points to %s", operatorTag, operatorCommit, apiTag, apiCommit)
+	}
 }
 
 func TestVersionMetadata(t *testing.T) {
