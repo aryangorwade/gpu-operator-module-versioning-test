@@ -33,7 +33,7 @@ github.com/NVIDIA/go-nvlib/pkg/nvpci
 github.com/NVIDIA/go-nvlib/pkg/nvpci/bytes
 github.com/NVIDIA/go-nvlib/pkg/nvpci/mmio
 github.com/NVIDIA/go-nvlib/pkg/pciids
-# github.com/NVIDIA/gpu-operator/api v0.8.0 => ./api
+# github.com/NVIDIA/gpu-operator/api v0.2603.3 => ./api
 ## explicit; go 1.26.3
 github.com/NVIDIA/gpu-operator/api/image
 github.com/NVIDIA/gpu-operator/api/nvidia/v1
