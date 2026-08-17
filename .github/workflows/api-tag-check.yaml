@@ -1,51 +1,59 @@
-name: Verify Unreleased API Version
+name: Validate Release API Version
 
 on:
   pull_request:
     paths:
-      - go.mod
+      - "go.mod"
+      - "api/go.mod"
+      - "versions.mk"
+      - "vendor/modules.txt"
+      - ".github/scripts/versioning.py"
+      - ".github/scripts/versioning_test.py"
+      - ".github/workflows/api-tag-check.yaml"
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  verify-api-tag:
-    name: Referenced API tag does not exist
+  validate-versioning:
+    name: Operator and API versions are mapped
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Verify changed API version is unreleased
+      - name: Validate version mapping
+        run: make validate-versioning
+
+      - name: Verify a changed API version is unreleased
+        if: github.event_name == 'pull_request'
         shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
 
-          api_module="github.com/NVIDIA/gpu-operator/api"
-          api_version="$(awk -v module="${api_module}" '$1 == module { print $2; exit }' go.mod)"
+          api_version="$(python3 .github/scripts/versioning.py required-api)"
+          git show "${BASE_SHA}:go.mod" >"${RUNNER_TEMP}/base.go.mod"
           base_version="$(
-            git show "${{ github.event.pull_request.base.sha }}:go.mod" |
-              awk -v module="${api_module}" '$1 == module { print $2; exit }'
+            python3 .github/scripts/versioning.py required-api \
+              --go-mod "${RUNNER_TEMP}/base.go.mod"
           )"
 
-          if [[ -z "${api_version}" || -z "${base_version}" ]]; then
-            echo "::error::Could not read ${api_module} from the root go.mod"
-            exit 1
-          fi
-
           if [[ "${api_version}" == "${base_version}" ]]; then
-            echo "${api_module} remains at ${api_version}; no release check is needed."
+            echo "API requirement remains at ${api_version}; no unpublished-tag check is needed."
             exit 0
           fi
 
           api_tag="api/${api_version}"
           repository_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
 
-          echo "Root module changes ${api_module} from ${base_version} to ${api_version}"
-          echo "Confirming ${api_tag} is not already published in ${repository_url}"
+          echo "API requirement changes from ${base_version} to ${api_version}."
+          echo "Confirming ${api_tag} has not already been published."
 
           if git ls-remote --exit-code --tags \
             "${repository_url}" "refs/tags/${api_tag}" >/dev/null; then
@@ -53,4 +61,4 @@ jobs:
             exit 1
           fi
 
-          echo "Verified that ${api_tag} is available for the upcoming release."
+          echo "Verified ${api_tag} is available for this release."

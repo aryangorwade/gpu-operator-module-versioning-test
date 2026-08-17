@@ -33,7 +33,7 @@ github.com/NVIDIA/go-nvlib/pkg/nvpci
 github.com/NVIDIA/go-nvlib/pkg/nvpci/bytes
 github.com/NVIDIA/go-nvlib/pkg/nvpci/mmio
 github.com/NVIDIA/go-nvlib/pkg/pciids
-# github.com/NVIDIA/gpu-operator/api v0.2603.3 => ./api
+# github.com/NVIDIA/gpu-operator/api v0.2607.0 => ./api
 ## explicit; go 1.26.3
 github.com/NVIDIA/gpu-operator/api/image
 github.com/NVIDIA/gpu-operator/api/nvidia/v1
@@ -462,7 +462,6 @@ golang.org/x/mod/internal/lazyregexp
 golang.org/x/mod/modfile
 golang.org/x/mod/module
 golang.org/x/mod/semver
-golang.org/x/mod/zip
 # golang.org/x/net v0.57.0
 ## explicit; go 1.25.0
 golang.org/x/net/html

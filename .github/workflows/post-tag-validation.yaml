@@ -5,101 +5,151 @@ on:
     tags:
       - "v*"
       - "api/v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Operator or API release tag to validate
+        required: true
+        type: string
 
 permissions:
   contents: read
 
+concurrency:
+  group: lockstep-release-${{ github.sha }}
+  cancel-in-progress: false
+
 jobs:
   validate-release:
     name: Operator and API release are in sync
+    if: github.event_name == 'workflow_dispatch' || !contains(github.ref_name, '-')
     runs-on: ubuntu-latest
     steps:
       - name: Checkout tagged commit
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          fetch-tags: true
           persist-credentials: false
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}
 
       - name: Install Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
 
-      - name: Resolve lockstep versions
+      - name: Resolve lockstep release
         id: release
-        shell: bash
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
         run: |
-          set -euo pipefail
+          python3 .github/scripts/versioning.py resolve-tag \
+            "${RELEASE_TAG}" --github-output "${GITHUB_OUTPUT}"
 
-          if [[ "${RELEASE_TAG}" =~ ^v([0-9]{2})\.([0-9]{1,2})\.([0-9]+)$ ]]; then
-            operator_major="${BASH_REMATCH[1]}"
-            operator_minor="${BASH_REMATCH[2]}"
-            operator_patch="${BASH_REMATCH[3]}"
-            printf -v padded_minor "%02d" "${operator_minor}"
-            operator_tag="${RELEASE_TAG}"
-            api_version="v0.${operator_major}${padded_minor}.${operator_patch}"
-            api_tag="api/${api_version}"
-          elif [[ "${RELEASE_TAG}" =~ ^api/v0\.([0-9]{4})\.([0-9]+)$ ]]; then
-            encoded_minor="${BASH_REMATCH[1]}"
-            operator_major="${encoded_minor:0:2}"
-            operator_minor="$((10#${encoded_minor:2:2}))"
-            operator_patch="${BASH_REMATCH[2]}"
-            operator_tag="v${operator_major}.${operator_minor}.${operator_patch}"
-            api_tag="${RELEASE_TAG}"
-            api_version="${api_tag#api/}"
-          else
-            echo "::error::Unsupported release tag ${RELEASE_TAG}"
-            exit 1
-          fi
-
-          {
-            echo "operator_tag=${operator_tag}"
-            echo "api_tag=${api_tag}"
-            echo "api_version=${api_version}"
-          } >>"${GITHUB_OUTPUT}"
-
-      - name: Verify companion tag and module requirement
+      - name: Verify both tags point to this commit
         shell: bash
         env:
           OPERATOR_TAG: ${{ steps.release.outputs.operator_tag }}
           API_TAG: ${{ steps.release.outputs.api_tag }}
-          API_VERSION: ${{ steps.release.outputs.api_version }}
         run: |
           set -euo pipefail
 
-          tagged_commit="$(git rev-parse "${GITHUB_SHA}^{commit}")"
-          operator_commit="$(git rev-list -n 1 "${OPERATOR_TAG}")"
-          api_commit="$(git rev-list -n 1 "${API_TAG}")"
+          repository_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          release_commit="$(git rev-parse HEAD)"
 
-          if [[ "${operator_commit}" != "${tagged_commit}" ||
-                "${api_commit}" != "${tagged_commit}" ]]; then
-            echo "::error::${OPERATOR_TAG} and ${API_TAG} must point to ${tagged_commit}"
+          tag_commit() {
+            local tag="$1"
+            local commit
+            commit="$(
+              git ls-remote --tags "${repository_url}" "refs/tags/${tag}^{}" |
+                awk 'NR == 1 { print $1 }'
+            )"
+            if [[ -z "${commit}" ]]; then
+              commit="$(
+                git ls-remote --tags "${repository_url}" "refs/tags/${tag}" |
+                  awk 'NR == 1 { print $1 }'
+              )"
+            fi
+            printf '%s' "${commit}"
+          }
+
+          operator_commit="$(tag_commit "${OPERATOR_TAG}")"
+          api_commit="$(tag_commit "${API_TAG}")"
+          if [[ -z "${operator_commit}" || -z "${api_commit}" ]]; then
+            echo "::error::Both ${OPERATOR_TAG} and ${API_TAG} must be published."
+            exit 1
+          fi
+          if [[ "${operator_commit}" != "${release_commit}" ||
+                "${api_commit}" != "${release_commit}" ]]; then
+            echo "::error::${OPERATOR_TAG} and ${API_TAG} must both point to ${release_commit}."
+            echo "Operator tag commit: ${operator_commit}"
+            echo "API tag commit: ${api_commit}"
             exit 1
           fi
 
-          api_module="github.com/NVIDIA/gpu-operator/api"
-          required_version="$(
-            awk -v module="${api_module}" '$1 == module { print $2; exit }' go.mod
-          )"
-          if [[ "${required_version}" != "${API_VERSION}" ]]; then
-            echo "::error::Root go.mod requires ${required_version}; expected ${API_VERSION}"
-            exit 1
-          fi
+      - name: Verify repository version metadata
+        run: make validate-versioning
 
-          listed_version="$(go list -m -mod=mod -f '{{.Version}}' "${api_module}")"
-          if [[ "${listed_version}" != "${API_VERSION}" ]]; then
-            echo "::error::go list reported ${listed_version}; expected ${API_VERSION}"
-            exit 1
-          fi
-
-      - name: Build operator
-        run: go build -mod=vendor -o "${RUNNER_TEMP}/gpu-operator" ./cmd/gpu-operator
-
-      - name: Test module release
+      - name: Build the operator executable
         env:
-          GPU_OPERATOR_TAG: ${{ steps.release.outputs.operator_tag }}
-          GPU_OPERATOR_API_TAG: ${{ steps.release.outputs.api_tag }}
-          GPU_OPERATOR_API_VERSION: ${{ steps.release.outputs.api_version }}
+          OPERATOR_TAG: ${{ steps.release.outputs.operator_tag }}
+          API_VERSION: ${{ steps.release.outputs.api_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          binary="${RUNNER_TEMP}/gpu-operator"
+          go build -mod=vendor \
+            -ldflags "-X github.com/NVIDIA/gpu-operator/internal/info.version=${OPERATOR_TAG}" \
+            -o "${binary}" ./cmd/gpu-operator
+
+          go version -m "${binary}" | tee "${RUNNER_TEMP}/build-info.txt"
+          if ! awk -v module="github.com/NVIDIA/gpu-operator/api" \
+            -v version="${API_VERSION}" \
+            '$1 == "dep" && $2 == module && $3 == version { found = 1 }
+             END { exit !found }' "${RUNNER_TEMP}/build-info.txt"; then
+            echo "::error::Built executable does not record ${API_VERSION} as its API dependency."
+            exit 1
+          fi
+
+      - name: Verify the published API module
+        env:
+          API_VERSION: ${{ steps.release.outputs.api_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          canonical_repository="https://github.com/NVIDIA/gpu-operator"
+          release_repository="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+          git config --global \
+            "url.${release_repository}.insteadOf" "${canonical_repository}"
+
+          query_dir="${RUNNER_TEMP}/version-query"
+          mkdir -p "${query_dir}"
+          cd "${query_dir}"
+          go mod init example.com/gpu-operator-version-query
+          GOPROXY=direct GOSUMDB=off go list -m -json \
+            "github.com/NVIDIA/gpu-operator/api@${API_VERSION}" \
+            >module.json
+
+          python3 - "${API_VERSION}" <<'PY'
+          import json
+          import sys
+
+          with open("module.json") as stream:
+              module = json.load(stream)
+
+          expected_version = sys.argv[1]
+          expected_path = "github.com/NVIDIA/gpu-operator/api"
+          if module.get("Path") != expected_path or module.get("Version") != expected_version:
+              raise SystemExit(
+                  f"go list returned {module.get('Path')}@{module.get('Version')}; "
+                  f"expected {expected_path}@{expected_version}"
+              )
+          print(f"Verified {expected_path}@{expected_version}")
+          PY
+
+      - name: Run release integration tests
+        env:
+          GPU_OPERATOR_RELEASE_VALIDATION: "1"
         run: go test -v .
