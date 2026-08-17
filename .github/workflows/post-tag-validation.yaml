@@ -103,6 +103,12 @@ jobs:
             -ldflags "-X github.com/NVIDIA/gpu-operator/internal/info.version=${OPERATOR_TAG}" \
             -o "${binary}" ./cmd/gpu-operator
 
+          embedded_operator_version="$("${binary}" --version)"
+          if [[ "${embedded_operator_version}" != "${OPERATOR_TAG}" ]]; then
+            echo "::error::Built executable reports ${embedded_operator_version}; expected ${OPERATOR_TAG}."
+            exit 1
+          fi
+
           go version -m "${binary}" | tee "${RUNNER_TEMP}/build-info.txt"
           if ! awk -v module="github.com/NVIDIA/gpu-operator/api" \
             -v version="${API_VERSION}" \

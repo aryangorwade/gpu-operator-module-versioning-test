@@ -110,6 +110,14 @@ func TestRootRequiresMappedAPIVersion(t *testing.T) {
 }
 
 func TestBinaryRecordsMappedAPIDependency(t *testing.T) {
+	versionOutput, err := exec.Command(operatorBinaryPath, "--version").CombinedOutput()
+	if err != nil {
+		t.Fatalf("gpu-operator --version failed: %v\n%s", err, versionOutput)
+	}
+	if actual := strings.TrimSpace(string(versionOutput)); actual != operatorVersion {
+		t.Fatalf("gpu-operator --version = %q, want %q", actual, operatorVersion)
+	}
+
 	out, err := exec.Command("go", "version", "-m", operatorBinaryPath).CombinedOutput()
 	if err != nil {
 		t.Fatalf("go version -m failed: %v\n%s", err, out)
