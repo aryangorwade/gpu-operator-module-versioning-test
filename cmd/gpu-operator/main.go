@@ -79,9 +79,11 @@ func main() {
 	var leaderElectionNamespace string
 	var probeAddr string
 	var renewDeadline time.Duration
+	var showVersion bool
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
+	flag.BoolVar(&showVersion, "version", false, "Print the GPU Operator version and exit.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
@@ -99,6 +101,11 @@ func main() {
 	}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
+
+	if showVersion {
+		fmt.Println(info.GetVersionString())
+		return
+	}
 
 	logger := zap.New(zap.UseFlagOptions(&opts))
 	ctrl.SetLogger(logger)

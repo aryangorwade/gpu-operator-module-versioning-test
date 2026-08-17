@@ -22,9 +22,9 @@ The mapping can represent operator major and minor values from `0` through
 
 ## Current mapping
 
-- GPU Operator version and tag: `v26.7.0`
-- API module version required by the operator: `v0.2607.0`
-- API module Git tag: `api/v0.2607.0`
+- GPU Operator version and tag: `v26.8.0`
+- API module version required by the operator: `v0.2608.0`
+- API module Git tag: `api/v0.2608.0`
 
 Both tags must point to the same commit. The root module keeps a local
 `replace github.com/NVIDIA/gpu-operator/api => ./api` directive for development,
