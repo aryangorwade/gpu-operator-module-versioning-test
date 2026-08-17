@@ -398,8 +398,8 @@ github.com/russross/blackfriday/v2
 # github.com/shopspring/decimal v1.4.0
 ## explicit; go 1.10
 github.com/shopspring/decimal
-# github.com/sirupsen/logrus v1.9.4
-## explicit; go 1.17
+# github.com/sirupsen/logrus v1.10.0
+## explicit; go 1.23
 github.com/sirupsen/logrus
 # github.com/spf13/cast v1.7.0
 ## explicit; go 1.19
@@ -458,11 +458,7 @@ golang.org/x/crypto/pbkdf2
 golang.org/x/crypto/scrypt
 # golang.org/x/mod v0.38.0
 ## explicit; go 1.25.0
-golang.org/x/mod/internal/lazyregexp
-golang.org/x/mod/modfile
-golang.org/x/mod/module
 golang.org/x/mod/semver
-golang.org/x/mod/zip
 # golang.org/x/net v0.57.0
 ## explicit; go 1.25.0
 golang.org/x/net/html
