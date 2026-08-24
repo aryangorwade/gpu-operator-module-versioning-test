@@ -9,7 +9,7 @@ require (
 	github.com/regclient/regclient v0.11.5
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/mod v0.38.0
-	k8s.io/api v0.36.3
+	k8s.io/api v0.36.2
 	k8s.io/apimachinery v0.36.3
 	k8s.io/client-go v0.36.3
 	k8s.io/utils v0.0.0-20260507154919-ff6756f316d2
