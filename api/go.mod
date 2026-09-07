@@ -5,7 +5,7 @@ go 1.26.3
 require (
 	github.com/NVIDIA/k8s-kata-manager v0.2.3
 	github.com/NVIDIA/k8s-operator-libs v0.0.0-20260629200812-d720f2557494
-	github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring v0.93.0
+	github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring v0.93.1
 	github.com/regclient/regclient v0.11.5
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/mod v0.38.0
